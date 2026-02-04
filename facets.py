@@ -8,6 +8,7 @@ import math
 import numpy
 import openai
 import os
+import pathlib
 import scipy
 import sklearn
 import tiktoken
@@ -37,7 +38,9 @@ async def main():
     # of performance and reliability
     semaphore = asyncio.Semaphore(148)
 
-    async def embed(entry):
+    print("Reading files…")
+
+    async def read(entry):
         absolute_path = os.path.join(arguments.repository, entry)
 
         try:
@@ -53,14 +56,7 @@ async def main():
                 # TODO: chunk instead of truncate
                 truncated = tokens[:8192]
 
-                input = embedding_encoding.decode(truncated)
-
-                async with semaphore:
-                    response = await openai_client.embeddings.create(model=embedding_model, input=input)
-
-                embedding = response.data[0].embedding
-
-                return [ (entry, embedding) ]
+                return [ (entry, embedding_encoding.decode(truncated)) ]
 
         except UnicodeDecodeError:
             # Ignore documents that aren't UTF-8
@@ -76,13 +72,20 @@ async def main():
             # handled
             return [ ]
 
+    results = list(itertools.chain.from_iterable(await asyncio.gather(*(read(entry) for entry, _ in repository.index.entries))))
+
+    entries, input = zip(*results)
+
     print("Embedding files…")
 
-    results = list(itertools.chain.from_iterable(await asyncio.gather(*(embed(entry) for entry, _ in repository.index.entries))))
+    response = await openai_client.embeddings.create(
+      model=embedding_model,
+      input=input
+    )
+
+    embeddings = [ datum.embedding for datum in response.data ]
 
     print("Clustering files…")
-
-    entries, embeddings = zip(*results)
 
     N = len(embeddings)
 
@@ -166,9 +169,10 @@ async def main():
     # clusters and sometimes you find much more optimal clusterings at much
     # higher cluster counts.  For example, I've seen repositories where the
     # optimal cluster count was 600+.  However, we cap the maximum cluster
-    # count at 20, even if it's sometimes suboptimal, because that's the
-    # maximum number of clusters we actually want to present to the user.
-    n_clusters = min(N - 1, 20)
+    # count at the number of top-level folders because we don't want the
+    # clustering algorithm to present more options to the user than they would
+    # get by simply navigating from the top-level directory.
+    n_clusters = len([ entry for entry in entries if len(pathlib.Path(entry).parts) == 1 ])
 
     random_state = sklearn.utils.check_random_state(0)
 
