@@ -13,6 +13,10 @@ import scipy
 import sklearn
 import tiktoken
 
+max_tokens_per_embed = 8192
+
+max_tokens_per_batch_embed = 300000
+
 async def main():
     parser = argparse.ArgumentParser(
       prog='facets',
@@ -20,6 +24,7 @@ async def main():
     )
 
     parser.add_argument('repository')
+
     arguments = parser.parse_args()
 
     repository = git.Repo(arguments.repository)
@@ -38,7 +43,7 @@ async def main():
     # of performance and reliability
     semaphore = asyncio.Semaphore(148)
 
-    print("Reading files…")
+    print("[+] Reading files")
 
     async def read(entry):
         absolute_path = os.path.join(arguments.repository, entry)
@@ -54,7 +59,7 @@ async def main():
                 tokens = embedding_encoding.encode(annotated)
 
                 # TODO: chunk instead of truncate
-                truncated = tokens[:8192]
+                truncated = tokens[:max_tokens_per_embed]
 
                 return [ (entry, embedding_encoding.decode(truncated)) ]
 
@@ -74,18 +79,23 @@ async def main():
 
     results = list(itertools.chain.from_iterable(await asyncio.gather(*(read(entry) for entry, _ in repository.index.entries))))
 
-    entries, input = zip(*results)
+    entries, contents = zip(*results)
 
-    print("Embedding files…")
+    print("[+] Embedding file contents")
 
-    response = await openai_client.embeddings.create(
-      model=embedding_model,
-      input=input
-    )
+    max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
-    embeddings = [ datum.embedding for datum in response.data ]
+    async def embed(input):
+        response = await openai_client.embeddings.create(
+          model=embedding_model,
+          input=input
+        )
 
-    print("Clustering files…")
+        return [ datum.embedding for datum in response.data ]
+
+    embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*(embed(input) for input in itertools.batched(contents, max_embeds)))))
+
+    print("[+] Clustering embeddings")
 
     N = len(embeddings)
 
@@ -169,10 +179,12 @@ async def main():
     # clusters and sometimes you find much more optimal clusterings at much
     # higher cluster counts.  For example, I've seen repositories where the
     # optimal cluster count was 600+.  However, we cap the maximum cluster
-    # count at the number of top-level folders because we don't want the
-    # clustering algorithm to present more options to the user than they would
-    # get by simply navigating from the top-level directory.
-    n_clusters = len([ entry for entry in entries if len(pathlib.Path(entry).parts) == 1 ])
+    # count at 20 because we don't want to present more than that many choices
+    # to the user at any level of the decision tree.  Ideally we present around
+    # ≈7 choices but capping at 20 is just being conservative.
+    #
+    # As a bonus, capping at 20 improves performance, too.
+    n_clusters = min(N - 1, 20)
 
     random_state = sklearn.utils.check_random_state(0)
 
@@ -197,9 +209,9 @@ async def main():
       tol=0.0,
       v0=v0
     )
-    embedding = eigenvectors.T[n_clusters::-1] * dd
-    embedding = sklearn.utils.extmath._deterministic_vector_sign_flip(embedding)
-    embedding = embedding[1:n_clusters].T
+    full_embedding = eigenvectors.T[n_clusters::-1] * dd
+    full_embedding = sklearn.utils.extmath._deterministic_vector_sign_flip(full_embedding)
+    full_embedding = full_embedding[1:n_clusters].T
     eigenvalues = eigenvalues[n_clusters::-1]
     eigenvalues *= -1
 
@@ -210,7 +222,7 @@ async def main():
     # … is because we want at least two clusters (otherwise what's the point?).
     n_clusters = numpy.argmax(numpy.diff(eigenvalues)[2:]) + 2
 
-    embedding = embedding[:, :n_clusters]
+    embedding = full_embedding[:, :n_clusters]
 
     normalized_embedding = sklearn.preprocessing.normalize(embedding)
 
@@ -222,20 +234,41 @@ async def main():
 
     groups = collections.OrderedDict()
 
-    for (label, entry) in zip(labels, entries):
-        groups.setdefault(label, []).append(entry)
+    for (label, entry, vector) in zip(labels, entries, full_embedding):
+        groups.setdefault(label, []).append((entry, vector))
+
+    print("[+] Labeling clusters")
+    def render_group(values):
+        def key(value):
+            _, vector = value
+
+            return scipy.linalg.norm(vector)
+
+        entries = [ entry for entry, vector in sorted(values, reverse=True, key=key) ]
+
+        desired_entries = 403
+
+        step = math.ceil(len(entries) / desired_entries)
+
+        entries = entries[::step]
+
+        extra_files = len(values) - len(entries)
+        if extra_files > 0:
+            entries.append(f"… [{extra_files} more files]")
+
+        return "\n".join(sorted(entries))
 
     async def label(item):
-        my_label, my_entries = item
+        my_label, my_values = item
 
-        other_entries = [
-            entry
-            for other_label, other_entries in groups.items()
+        other_values = [
+            value
+            for other_label, other_values in groups.items()
             if my_label != other_label
-            for entry in other_entries
+            for value in other_values
         ]
 
-        prompt = f"Vector embedding plus clustering produced the following cluster of files:\n\n{"\n".join(my_entries)}\n\nDescribe in a few words what distinguishes that cluster of files from these other files in the project that don't belong to that cluster:\n\n{"\n".join(other_entries)}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the user-facing cluster label without any trimming"
+        prompt = f"Vector embedding plus clustering produced the following cluster of files:\n\n{render_group(my_values)}\n\nDescribe in a few words what distinguishes that cluster of files from these other files in the project that don't belong to that cluster:\n\n{render_group(other_values)}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the user-facing cluster label without any trimming"
 
         tokens = completion_encoding.encode(prompt)
 
@@ -245,7 +278,7 @@ async def main():
 
         summary = await openai_client.responses.create(model = completion_model, input = input)
 
-        return summary.output_text, "\n".join(my_entries)
+        return summary.output_text, render_group(my_values)
 
     results = await asyncio.gather(*(label(item) for item in groups.items()))
 
