@@ -22,7 +22,8 @@ from numpy import float32
 from numpy.typing import NDArray
 from openai import AsyncOpenAI
 from tiktoken import Encoding
-from typing import Generator, List
+from typing import TypeVar
+
 max_tokens_per_embed = 8192
 
 max_tokens_per_batch_embed = 300000
@@ -61,7 +62,7 @@ class Embed:
 
 @dataclasses.dataclass(frozen=True)
 class Cluster:
-    embeds: List[Embed]
+    embeds: list[Embed]
 
 async def embed(facets: Facets, repository: str) -> Cluster:
     print("[+] Embedding files")
@@ -118,7 +119,7 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     return Cluster([ Embed(entry, embedding) for entry, embedding in zip(entries, embeddings) ])
 
-def cluster(input: Cluster) -> List[Cluster]:
+def cluster(input: Cluster) -> list[Cluster]:
     print("[+] Clustering embeddings")
 
     if len(input.embeds) < 7:
@@ -268,71 +269,79 @@ def cluster(input: Cluster) -> List[Cluster]:
 
     return [ Cluster(embeds) for embeds in groups.values() ]
 
-def render_cluster(cluster):
-    def key(embed):
-        return scipy.linalg.norm(embed.embedding)
-
-    entries = [ embed.entry for embed in sorted(cluster.embeds, reverse=True, key=key) ]
-
-    desired_entries = 403
-
-    step = math.ceil(len(entries) / desired_entries)
-
-    entries = entries[::step]
-
-    extra_files = len(cluster.embeds) - len(entries)
-    if extra_files > 0:
-        entries.append(f"… [{extra_files} more files]")
-
-    return "\n".join(sorted(entries))
-
-async def label_clusters(facets: Facets, clusters: List[Cluster]) -> List[str]:
-    print("[+] Labeling clusters")
-
-    async def label(my_index, my_cluster):
-        other_cluster = Cluster([
-            embed
-            for other_index, other_cluster in enumerate(clusters)
-            if my_index != other_index
-            for embed in other_cluster.embeds
-        ])
-
-        prompt = f"Vector embedding plus clustering produced the following cluster of files:\n\n{render_cluster(my_cluster)}\n\nDescribe in a few words what distinguishes that cluster of files from these other files in the project that don't belong to that cluster:\n\n{render_cluster(other_cluster)}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the user-facing cluster label without any trimming"
-
-        tokens = facets.completion_encoding.encode(prompt)
-
-        truncated = tokens[:128000]
-
-        input = facets.completion_encoding.decode(truncated)
-
-        summary = await facets.openai_client.responses.create(model = facets.completion_model, input = input)
-
-        return summary.output_text
-
-    results = await asyncio.gather(*(label(my_index, my_cluster) for my_index, my_cluster in enumerate(clusters)))
-
-    return results
-
 @dataclasses.dataclass(frozen=True)
 class Tree:
     label: str
-    children: List["Tree"]
+    children: list["Tree"]
 
-async def tree(facets: Facets, label: str, c: Cluster):
-    files = [ Tree(embed.entry, []) for embed in c.embeds ]
+A = TypeVar('A')
 
-    sub_clusters = cluster(c)
+def zipper(elements: list[A]) -> list[tuple[list[A], A, list[A]]]:
+    return [
+        (elements[:index], element, elements[index + 1:])
+        for index, element in enumerate(elements)
+    ]
 
-    labels = await label_clusters(facets, sub_clusters)
+async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
+    async def label(element: tuple[list[Embed], Embed, list[Embed]]) -> Tree:
+        prefix, embed, suffix = element
 
-    children = await asyncio.gather(*(tree(facets, label, sub_cluster) for label, sub_cluster in zip(labels, sub_clusters)))
+        here = embed.entry
 
-    if not children:
-        children = files
+        other = "\n".join([ embed.entry for embed in prefix + suffix ])
+
+        input = f"Describe in a few words what distinguishes this file:\n\n{here}\n\n… from these other files:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
+
+        response = await facets.openai_client.responses.create(
+            model = facets.completion_model,
+            input = input
+        )
+
+        children = [ Tree(here, []) ]
+        return Tree(response.output_text, children)
+
+    trees = await asyncio.gather(*(label(tuple) for tuple in zipper(c.embeds)))
+
+    files = Tree(f"[{len(c.embeds)} files]", [ Tree(embed.entry, []) for embed in c.embeds ])
+
+    return [ files ] + trees
+
+async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
+    if len(c.embeds) <= 7:
+        return await label_leaves(facets, c)
     else:
-        children = [ Tree("[Files]", files) ] + children
+        async def label(element: tuple[list[list[Tree]], list[Tree], list[list[Tree]]]) -> Tree:
+            def render_trees(trees: list[Tree]) -> str:
+                return "\n".join([ tree.label for tree in trees ])
 
-    return Tree(label, children)
+            prefix, trees, suffix = element
+
+            here = render_trees(trees)
+
+            other = "\n\n".join([ render_trees(trees) for trees in prefix + suffix ])
+
+            input = f"Describe in a few words what distinguish this cluster of labels:\n\n{here}\n\n… from these other clusters of labels:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
+
+            response = await facets.openai_client.responses.create(
+                model = facets.completion_model,
+                input = input
+            )
+
+            return Tree(response.output_text, trees)
+
+        children = cluster(c)
+
+        treess = await asyncio.gather(*(label_nodes(facets, child) for child in children))
+
+        trees = await asyncio.gather(*(label(tuple) for tuple in zipper(treess)))
+        files = Tree(f"[{len(c.embeds)} files]", [ Tree(embed.entry, []) for embed in c.embeds ])
+
+        return [ files ] + trees
+    
+async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
+    trees = await label_nodes(facets, c)
+
+    return Tree(label, trees)
 
 class UI(textual.app.App):
     def __init__(self, tree_):
