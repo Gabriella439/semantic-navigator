@@ -58,6 +58,7 @@ def initialize() -> Facets:
 @dataclasses.dataclass(frozen=True)
 class Embed:
     entry: str
+    content: str
     embedding: NDArray[float32]
 
 @dataclasses.dataclass(frozen=True)
@@ -117,7 +118,7 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*(embed_batch(input) for input in itertools.batched(contents, max_embeds)))))
 
-    return Cluster([ Embed(entry, embedding) for entry, embedding in zip(entries, embeddings) ])
+    return Cluster([ Embed(entry, content, embedding) for entry, content, embedding in zip(entries, contents, embeddings) ])
 
 def cluster(input: Cluster) -> list[Cluster]:
     print("[+] Clustering embeddings")
@@ -125,7 +126,7 @@ def cluster(input: Cluster) -> list[Cluster]:
     if len(input.embeds) < 7:
         return []
 
-    entries, embeddings = zip(*((embed.entry, embed.embedding) for embed in input.embeds))
+    entries, contents, embeddings = zip(*((embed.entry, embed.content, embed.embedding) for embed in input.embeds))
 
     N = len(embeddings)
 
@@ -264,14 +265,15 @@ def cluster(input: Cluster) -> list[Cluster]:
 
     groups = collections.OrderedDict()
 
-    for (label, entry, vector) in zip(labels, entries, full_embedding):
-        groups.setdefault(label, []).append(Embed(entry, vector))
+    for (label, entry, content, vector) in zip(labels, entries, contents, full_embedding):
+        groups.setdefault(label, []).append(Embed(entry, content, vector))
 
     return [ Cluster(embeds) for embeds in groups.values() ]
 
 @dataclasses.dataclass(frozen=True)
 class Tree:
     label: str
+    files: list[str]
     children: list["Tree"]
 
 A = TypeVar('A')
@@ -286,9 +288,12 @@ async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
     async def label(element: tuple[list[Embed], Embed, list[Embed]]) -> Tree:
         prefix, embed, suffix = element
 
-        here = embed.entry
+        def render_embed(embed: Embed) -> str:
+            return f"{embed.entry}: {embed.content}"
 
-        other = "\n".join([ embed.entry for embed in prefix + suffix ])
+        here = render_embed(embed)
+
+        other = "\n".join([ render_embed(embed) for embed in prefix + suffix ])
 
         input = f"Describe in a few words what distinguishes this file:\n\n{here}\n\n… from these other files:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
 
@@ -297,14 +302,11 @@ async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
             input = input
         )
 
-        children = [ Tree(here, []) ]
-        return Tree(response.output_text, children)
+        files = [ embed.entry ]
 
-    trees = await asyncio.gather(*(label(tuple) for tuple in zipper(c.embeds)))
+        return Tree(response.output_text, files, [])
 
-    files = Tree(f"[{len(c.embeds)} files]", [ Tree(embed.entry, []) for embed in c.embeds ])
-
-    return [ files ] + trees
+    return await asyncio.gather(*(label(tuple) for tuple in zipper(c.embeds)))
 
 async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
     if len(c.embeds) <= 7:
@@ -314,34 +316,35 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
             def render_trees(trees: list[Tree]) -> str:
                 return "\n".join([ tree.label for tree in trees ])
 
-            prefix, trees, suffix = element
+            prefix, children, suffix = element
 
-            here = render_trees(trees)
+            here = render_trees(children)
 
             other = "\n\n".join([ render_trees(trees) for trees in prefix + suffix ])
 
-            input = f"Describe in a few words what distinguish this cluster of labels:\n\n{here}\n\n… from these other clusters of labels:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
+            input = f"Describe in a few words what distinguish this cluster:\n\n{here}\n\n… from these other clusters:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
 
             response = await facets.openai_client.responses.create(
                 model = facets.completion_model,
                 input = input
             )
 
-            return Tree(response.output_text, trees)
+            files = [ file for child in children for file in child.files ]
+
+            return Tree(response.output_text, files, children)
 
         children = cluster(c)
 
         treess = await asyncio.gather(*(label_nodes(facets, child) for child in children))
 
-        trees = await asyncio.gather(*(label(tuple) for tuple in zipper(treess)))
-        files = Tree(f"[{len(c.embeds)} files]", [ Tree(embed.entry, []) for embed in c.embeds ])
+        return await asyncio.gather(*(label(tuple) for tuple in zipper(treess)))
 
-        return [ files ] + trees
-    
 async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    trees = await label_nodes(facets, c)
+    children = await label_nodes(facets, c)
 
-    return Tree(label, trees)
+    files = [ file for child in children for file in child.files ]
+
+    return Tree(label, files, children)
 
 class UI(textual.app.App):
     def __init__(self, tree_):
@@ -349,14 +352,18 @@ class UI(textual.app.App):
         self.tree_ = tree_
 
     async def on_mount(self):
-        self.treeview = textual.widgets.Tree(self.tree_.label)
-        def loop(node, children):
+        self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+        def loop(node, files, children):
             for child in children:
-                n = node.add(child.label)
-                n.allow_expand = bool(child.children)
-                loop(n, child.children)
+                n = node.add(f"{child.label} ({len(child.files)})")
+                n.allow_expand = True
+                loop(n, child.files, child.children)
 
-        loop(self.treeview.root, self.tree_.children)
+            for file in sorted(files):
+                n = node.add(file)
+                n.allow_expand = False
+
+        loop(self.treeview.root, self.tree_.files, self.tree_.children)
 
         self.mount(self.treeview)
 
