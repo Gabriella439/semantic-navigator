@@ -355,13 +355,32 @@ class UI(textual.app.App):
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
         def loop(node, files, children):
             for child in children:
-                n = node.add(f"{child.label} ({len(child.files)})")
-                n.allow_expand = True
-                loop(n, child.files, child.children)
+                prefix = os.path.commonprefix(child.files)
+                suffix = os.path.commonprefix([ file[len(prefix):][::-1] for file in child.files ])[::-1]
+                if any([ file[len(prefix):-len(suffix)] for file in child.files ]):
+                    star = "*"
+                else:
+                    star = ""
 
-            for file in sorted(files):
-                n = node.add(file)
-                n.allow_expand = False
+                if prefix:
+                    if suffix:
+                        pattern = f"{prefix}{star}{suffix}: "
+                    else:
+                        pattern = f"{prefix}{star}: "
+                else:
+                    if suffix:
+                        pattern = f"{star}{suffix}: "
+                    else:
+                        pattern = ""
+
+                if len(child.files) <= 1:
+                    n = node.add(f"{pattern}{child.label}")
+                    n.allow_expand = False
+                else:
+                    n = node.add(f"{pattern}{child.label} ({len(child.files)})")
+                    n.allow_expand = True
+
+                    loop(n, child.files, child.children)
 
         loop(self.treeview.root, self.tree_.files, self.tree_.children)
 
