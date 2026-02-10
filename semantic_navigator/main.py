@@ -45,7 +45,10 @@ def initialize(completion_model: str, embedding_model: str) -> Facets:
 
     embedding_encoding = tiktoken.encoding_for_model(embedding_model)
 
-    completion_encoding = tiktoken.encoding_for_model(completion_model)
+    try:
+        completion_encoding = tiktoken.encoding_for_model(completion_model)
+    except KeyError:
+        completion_encoding = tiktoken.get_encoding("o200k_base")
 
     return Facets(
         openai_client = openai_client,
@@ -334,7 +337,7 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
 
         rendered_embeds = "\n\n".join([ render_embed(embed) for embed in c.embeds ])
 
-        input = f"Describe in ≈3 words what distinguishes each one of these files from the other files:\n\n{rendered_embeds}"
+        input = f"Describe in ≈3 words what distinguishes each one of these files from the other files.  Don't include the file path/name in the description.\n\n{rendered_embeds}"
 
         response = await facets.openai_client.responses.parse(
             model = facets.completion_model,
