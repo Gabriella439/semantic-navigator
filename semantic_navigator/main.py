@@ -28,7 +28,7 @@ max_tokens_per_batch_embed = 300000
 
 max_leaves = 7
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class Facets:
     openai_client: AsyncOpenAI
     embedding_model: str
@@ -58,13 +58,13 @@ def initialize(completion_model: str, embedding_model: str) -> Facets:
         completion_encoding = completion_encoding
     )
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class Embed:
     entry: str
     content: str
     embedding: NDArray[float32]
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class Cluster:
     embeds: list[Embed]
 
@@ -76,23 +76,23 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
         try:
             async with aiofiles.open(absolute_path, "rb") as handle:
-                annotation = f"{path}:\n\n"
+                prefix = f"{path}:\n\n"
 
                 bytestring = await handle.read()
 
                 text = bytestring.decode("utf-8")
 
-                annotation_tokens = facets.embedding_encoding.encode(annotation)
-                text_tokens       = facets.embedding_encoding.encode(text)
+                prefix_tokens = facets.embedding_encoding.encode(prefix)
+                text_tokens   = facets.embedding_encoding.encode(text)
 
-                max_tokens_per_chunk = max_tokens_per_embed - len(annotation_tokens)
+                max_tokens_per_chunk = max_tokens_per_embed - len(prefix_tokens)
 
                 return [
-                    (path, facets.embedding_encoding.decode(annotation_tokens + list(chunk)))
+                    (path, facets.embedding_encoding.decode(prefix_tokens + list(chunk)))
 
                     # TODO: This currently only takes the first chunk because
                     # GPT has trouble labeling chunks in order when multiple
-                    # chunks have the same file name.  Remoe the `[:1]` when
+                    # chunks have the same file name.  Remove the `[:1]` when
                     # this is fixed.
                     for chunk in list(itertools.batched(text_tokens, max_tokens_per_chunk))[:1]
                 ]
@@ -126,8 +126,8 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     async def embed_batch(input):
         response = await facets.openai_client.embeddings.create(
-            model=facets.embedding_model,
-            input=input
+            model = facets.embedding_model,
+            input = input
         )
 
         return [
@@ -171,12 +171,14 @@ def cluster(input: Cluster) -> list[Cluster]:
     # radial-basis function.
     def get_nearest_neighbors(n_neighbors):
         nearest_neighbors = sklearn.neighbors.NearestNeighbors(
-          n_neighbors=n_neighbors,
-          metric="cosine",
-          n_jobs=-1
+            n_neighbors = n_neighbors,
+            metric = "cosine",
+            n_jobs = -1
         ).fit(normalized)
 
-        directed_graph = nearest_neighbors.kneighbors_graph(mode="connectivity")
+        directed_graph = nearest_neighbors.kneighbors_graph(
+            mode = "connectivity"
+        )
 
         undirected_graph = directed_graph.maximum(directed_graph.T)
 
@@ -221,7 +223,7 @@ def cluster(input: Cluster) -> list[Cluster]:
 
     data = numpy.exp(-(d * d) / denominator).astype(numpy.float32)
 
-    similarities = scipy.sparse.coo_matrix((data, (rows, columns)), shape=(N, N)).tocsr()
+    similarities = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
 
     affinity = (similarities + similarities.T) * 0.5
     affinity.setdiag(1.0)
@@ -248,9 +250,9 @@ def cluster(input: Cluster) -> list[Cluster]:
     random_state = sklearn.utils.check_random_state(0)
 
     laplacian, dd = scipy.sparse.csgraph.laplacian(
-      affinity,
-      normed=True,
-      return_diag=True
+        affinity,
+        normed = True,
+        return_diag = True
     )
 
     # laplacian = set_diag(laplacian, 1, True)
@@ -261,12 +263,12 @@ def cluster(input: Cluster) -> list[Cluster]:
     laplacian *= -1
     v0 = random_state.uniform(-1, 1, N)
     eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-      laplacian,
-      k=n_clusters,
-      sigma=1.0,
-      which='LM',
-      tol=0.0,
-      v0=v0
+        laplacian,
+        k = n_clusters,
+        sigma = 1.0,
+        which = 'LM',
+        tol = 0.0,
+        v0 = v0
     )
     full_embedding = eigenvectors.T[n_clusters::-1] * dd
     full_embedding = sklearn.utils.extmath._deterministic_vector_sign_flip(full_embedding)
@@ -286,9 +288,9 @@ def cluster(input: Cluster) -> list[Cluster]:
     normalized_embedding = sklearn.preprocessing.normalize(embedding)
 
     labels = sklearn.cluster.KMeans(
-      n_clusters=n_clusters,
-      random_state=0,
-      n_init="auto"
+        n_clusters = n_clusters,
+        random_state = 0,
+        n_init = "auto"
     ).fit_predict(normalized_embedding)
 
     groups = collections.OrderedDict()
@@ -298,7 +300,7 @@ def cluster(input: Cluster) -> list[Cluster]:
 
     return [ Cluster(embeds) for embeds in groups.values() ]
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class Tree:
     label: str
     files: list[str]
@@ -330,7 +332,7 @@ def to_pattern(files):
         else:
             return ""
 
-@dataclass(frozen=True)
+@dataclass(frozen = True)
 class Labels(BaseModel):
     labels: list[str]
 
@@ -407,6 +409,7 @@ class UI(textual.app.App):
 
     async def on_mount(self):
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+
         def loop(node, children):
             for child in children:
                 if len(child.files) <= 1:
@@ -424,13 +427,13 @@ class UI(textual.app.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="facets",
-        description="Cluster documents by semantic facets",
+        prog = "facets",
+        description = "Cluster documents by semantic facets",
     )
 
     parser.add_argument("repository")
-    parser.add_argument("--completion-model", default="gpt-5-mini")
-    parser.add_argument("--embedding-model", default="text-embedding-3-large")
+    parser.add_argument("--completion-model", default = "gpt-5-mini")
+    parser.add_argument("--embedding-model", default = "text-embedding-3-large")
     arguments = parser.parse_args()
 
     facets = initialize(arguments.completion_model, arguments.embedding_model)
