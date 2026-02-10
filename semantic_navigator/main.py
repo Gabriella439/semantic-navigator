@@ -36,16 +36,16 @@ class Facets:
     embedding_encoding: Encoding
     completion_encoding: Encoding
 
-def initialize() -> Facets:
+def initialize(completion_model: str, embedding_model: str) -> Facets:
     openai_client = AsyncOpenAI()
 
-    embedding_model = "text-embedding-3-large"
+    embedding_model = embedding_model
 
-    completion_model = "gpt-5.2"
+    completion_model = completion_model
 
     embedding_encoding = tiktoken.encoding_for_model(embedding_model)
 
-    completion_encoding = tiktoken.get_encoding("o200k_base")
+    completion_encoding = tiktoken.encoding_for_model(completion_model)
 
     return Facets(
         openai_client = openai_client,
@@ -375,7 +375,6 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
             response = await facets.openai_client.responses.create(
                 model = facets.completion_model,
                 input = input,
-                temperature = 0
             )
 
             files = [ file for child in children for file in child.files ]
@@ -421,14 +420,16 @@ class UI(textual.app.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='facets',
-        description='Cluster documents by semantic facets',
+        prog="facets",
+        description="Cluster documents by semantic facets",
     )
 
-    parser.add_argument('repository')
+    parser.add_argument("repository")
+    parser.add_argument("--completion-model", default="gpt-5-mini")
+    parser.add_argument("--embedding-model", default="text-embedding-3-large")
     arguments = parser.parse_args()
 
-    facets = initialize()
+    facets = initialize(arguments.completion_model, arguments.embedding_model)
 
     async def async_tasks():
         initial_cluster = await embed(facets, arguments.repository)
