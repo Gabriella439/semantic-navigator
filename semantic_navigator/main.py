@@ -316,8 +316,8 @@ def cluster(input: Cluster) -> list[Cluster]:
 
     groups = collections.OrderedDict()
 
-    for (label, entry, content, spectral_embedding) in zip(labels, entries, contents, spectral_embeddings):
-        groups.setdefault(label, []).append(Embed(entry, content, spectral_embedding))
+    for (label, entry, content, embedding) in zip(labels, entries, contents, embeddings):
+        groups.setdefault(label, []).append(Embed(entry, content, embedding))
 
     return [ Cluster(embeds) for embeds in groups.values() ]
 
