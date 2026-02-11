@@ -153,10 +153,19 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     return Cluster(embeds)
 
+# The clustering algorithm works can go as low as 1 here, but we set it higher
+# for two reasons:
+#
+# - it's easier for users to navigate when there is more branching at the
+#   leaves
+# - this also avoids straining the tree visualizer, which doesn't like a really
+#   deeply nested tree structure.
+max_leaves = 20
+
 def cluster(input: Cluster) -> list[Cluster]:
     N = len(input.embeds)
 
-    if N <= 1:
+    if N <= max_leaves:
         return [input]
 
     entries, contents, embeddings = zip(*(
