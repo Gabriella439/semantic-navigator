@@ -310,10 +310,10 @@ def cluster(input: Cluster) -> list[Cluster]:
     #
     # The reason the suggested cluster count is not just:
     #
-    #     numpy.argmax(numpy.diff(eigenvalues))
+    #     numpy.argmax(numpy.diff(eigenvalues)) + 1
     #
-    # … is because we want at least one cluster
-    n_clusters = numpy.argmax(numpy.diff(eigenvalues)) + 1
+    # … is because we want at least two clusters
+    n_clusters = numpy.argmax(numpy.diff(eigenvalues[1:])) + 2
 
     spectral_embeddings = wide_spectral_embeddings[:, :n_clusters]
 
