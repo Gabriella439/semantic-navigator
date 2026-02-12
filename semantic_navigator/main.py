@@ -364,8 +364,13 @@ def to_pattern(files):
         else:
             return ""
 
+class Label(BaseModel):
+    overarchingTheme: str
+    distinguishingFeature: str
+    label: str
+    
 class Labels(BaseModel):
-    labels: list[str]
+    labels: list[Label]
 
 async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
@@ -376,7 +381,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         rendered_embeds = "\n\n".join([ render_embed(embed) for embed in c.embeds ])
 
-        input = f"Describe each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
+        input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
 
         response = await facets.openai_client.responses.parse(
             model = facets.completion_model,
@@ -389,7 +394,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
         # assert len(response.output_parsed.labels) == len(c.embeds)
 
         return [
-            Tree(f"{embed.entry}: {label}", [ embed.entry ], [])
+            Tree(f"{embed.entry}: {label.label}", [ embed.entry ], [])
             for label, embed in zip(response.output_parsed.labels, c.embeds)
         ]
 
@@ -413,7 +418,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
 
-        input = f"Describe each cluster in 2 words.\n\n{rendered_clusters}"
+        input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
 
         response = await facets.openai_client.responses.parse(
             model = facets.completion_model,
@@ -433,7 +438,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
             ]
 
         return [
-            Tree(f"{to_pattern(to_files(trees))}{label}", to_files(trees), trees)
+            Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
             for label, trees in zip(response.output_parsed.labels, treess)
         ]
 
