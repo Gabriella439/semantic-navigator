@@ -26,5 +26,8 @@ semantic-navigator = "semantic_navigator.main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = ["pytest"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["semantic_navigator"]

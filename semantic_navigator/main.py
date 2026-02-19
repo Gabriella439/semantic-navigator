@@ -1,1334 +1,44 @@
-import aiofiles
 import argparse
 import asyncio
-import collections
-import hashlib
-import itertools
-import json
-import math
-import numpy
-import os
-import re
-import scipy
 import shlex
 import shutil
-import sklearn
-import subprocess
-import sys
 import time
+
 import textual
 import textual.app
 import textual.widgets
 
-from contextlib import contextmanager
-from dataclasses import dataclass
-from dulwich.errors import NotGitRepository
-from dulwich.repo import Repo
-from fastembed import TextEmbedding
-from numpy import float32
-from numpy.typing import NDArray
-from pathlib import Path, PurePath
-from pydantic import BaseModel
-from sklearn.neighbors import NearestNeighbors
-from tqdm import tqdm
-from tqdm.asyncio import tqdm_asyncio
-from typing import Iterable, TypeVar
+# Re-export all public names for backwards compatibility
+from semantic_navigator.models import (  # noqa: F401
+    Aspect, AspectPool, Cluster, ClusterTree, Embed, Facets, Label, Labels, Tree,
+)
+from semantic_navigator.util import (  # noqa: F401
+    _fmt_time, _sanitize_path, case_insensitive_glob, extract_json, repair_json, timed,
+)
+from semantic_navigator.cache import (  # noqa: F401
+    app_cache_dir, cluster_hash, content_hash, embedding_cache_dir, label_cache_dir,
+    list_cached_keys, load_cached_cluster_labels, load_cached_embedding, load_cached_label,
+    repo_cache_dir, save_cached_cluster_labels, save_cached_embedding, save_cached_label,
+)
+from semantic_navigator.gpu import (  # noqa: F401
+    _detect_gpu_memory_linux, _detect_gpu_memory_windows, _list_devices_linux,
+    _resolve_gpu_layers, detect_device_memory, gguf_quant_preference, list_devices,
+    select_best_gguf,
+)
+from semantic_navigator.inference import (  # noqa: F401
+    _build_labels_schema, _create_cli_aspects, _create_embedding_model,
+    _create_local_aspects, _create_local_model, _create_openai_aspects,
+    _invoke_cli, _invoke_local, _invoke_openai, _local_complete,
+    _parse_raw_response, _validate_label_count, complete, initialize,
+    max_count_retries, max_retries,
+)
+from semantic_navigator.pipeline import (  # noqa: F401
+    _count_tree_depth, _count_tree_leaves, _embed_with_fastembed, _embed_with_openai,
+    _generate_paths, _label_cluster_node, _label_leaf_node, _read_file,
+    build_cluster_tree, cluster, count_cached_labels, embed, label_nodes,
+    max_clusters, max_leaves, to_files, to_pattern, tree,
+)
 
-T = TypeVar("T", bound=BaseModel)
-
-def _fmt_time(seconds: float) -> str:
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    minutes = int(seconds // 60)
-    secs = seconds % 60
-    return f"{minutes}m {secs:.0f}s"
-
-@contextmanager
-def timed(label: str, timings: dict[str, float] | None = None):
-    """Context manager that prints elapsed time for a phase."""
-    start = time.monotonic()
-    yield
-    elapsed = time.monotonic() - start
-    print(f"{label} ({_fmt_time(elapsed)})")
-    if timings is not None:
-        timings[label] = elapsed
-
-max_clusters = 20
-
-@dataclass(frozen = True)
-class Aspect:
-    """A single inference backend (CLI tool, local model, or OpenAI)."""
-    name: str
-    cli_command: list[str] | None
-    local_model: object | None
-    local_n_ctx: int | None
-    openai_client: object | None
-    openai_model: str | None
-
-class AspectPool:
-    """Async pool that distributes work across multiple inference backends."""
-    def __init__(self, aspects: list[Aspect]):
-        self.aspects = aspects
-        self._queue: asyncio.Queue[Aspect] | None = None
-
-    def _ensure_queue(self) -> asyncio.Queue[Aspect]:
-        if self._queue is None:
-            self._queue = asyncio.Queue()
-            for a in self.aspects:
-                self._queue.put_nowait(a)
-        return self._queue
-
-    async def acquire(self) -> Aspect:
-        return await self._ensure_queue().get()
-
-    def release(self, aspect: Aspect) -> None:
-        self._ensure_queue().put_nowait(aspect)
-
-    @property
-    def min_local_n_ctx(self) -> int | None:
-        ctxs = [a.local_n_ctx for a in self.aspects if a.local_n_ctx is not None]
-        return min(ctxs) if ctxs else None
-
-@dataclass(frozen = True)
-class Facets:
-    repository: str
-    model_identity: str
-    pool: AspectPool
-    embedding_model: TextEmbedding | None
-    embedding_model_name: str
-    gpu: bool
-    batch_size: int
-    timeout: int
-    debug: bool
-    openai_client: object | None
-    openai_embedding_model: str | None
-
-def list_devices():
-    if sys.platform == "win32":
-        result = subprocess.run(
-            ["powershell", "-Command",
-             "Get-CimInstance Win32_VideoController | Select-Object -Property Name"],
-            capture_output = True, text = True
-        )
-        names = [
-            line.strip() for line in result.stdout.strip().splitlines()
-            if line.strip() and line.strip() != "Name" and not line.strip().startswith("----")
-        ]
-    else:
-        names = _list_devices_linux()
-    print("GPU devices:")
-    for i, name in enumerate(names):
-        vram = detect_device_memory(True, i)
-        if vram is not None:
-            print(f"  {i}: {name} ({vram / 1e9:.1f} GB)")
-        else:
-            print(f"  {i}: {name} (unknown VRAM)")
-
-def _list_devices_linux() -> list[str]:
-    """List GPU device names on Linux via nvidia-smi or rocm-smi."""
-    names: list[str] = []
-    # Try NVIDIA first
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            names.extend(line.strip() for line in result.stdout.strip().splitlines() if line.strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    # Try AMD ROCm
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showproductname"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                # rocm-smi output: "GPU[0]  : Card series:  AMD Radeon ..."
-                match = re.search(r"Card series:\s*(.+)", line)
-                if match:
-                    names.append(match.group(1).strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return names
-
-def case_insensitive_glob(pattern: str) -> str:
-    return ''.join(
-        f'[{c.upper()}{c.lower()}]' if c.isalpha() else c
-        for c in pattern
-    )
-
-gguf_quant_preference = [
-    "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s", "q6_k", "q3_k_l",
-    "q3_k_m", "q8_0", "q4_0", "q5_0", "q3_k_s", "q2_k",
-    "fp16", "f16",
-]
-
-def _detect_gpu_memory_windows() -> list[int | None]:
-    """Detect VRAM for all GPUs on Windows, ordered by WMI device index.
-    Correlates WMI PNPDeviceID with registry MatchingDeviceId to find
-    64-bit memory values (AdapterRAM is only 32-bit and overflows >4GB)."""
-    # Get PNPDeviceIDs in WMI order
-    script = (
-        "$pnps = (Get-CimInstance Win32_VideoController).PNPDeviceID;"
-        "$base = 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}';"
-        "$map = @{};"
-        "foreach ($i in 0..20) {"
-        "  $p = \"$base\\\" + $i.ToString('D4');"
-        "  if (Test-Path $p) {"
-        "    $props = Get-ItemProperty $p -ErrorAction SilentlyContinue;"
-        "    if ($props.MatchingDeviceId -and $props.'HardwareInformation.qwMemorySize') {"
-        "      $map[$props.MatchingDeviceId] = $props.'HardwareInformation.qwMemorySize'"
-        "    }"
-        "  }"
-        "};"
-        "foreach ($pnp in $pnps) {"
-        "  $found = $false;"
-        "  foreach ($key in $map.Keys) {"
-        "    if ($pnp -like \"$key*\") { Write-Host $map[$key]; $found = $true; break }"
-        "  };"
-        "  if (-not $found) { Write-Host 'None' }"
-        "}"
-    )
-    result = subprocess.run(
-        ["powershell", "-Command", script],
-        capture_output=True, text=True, timeout=15,
-    )
-    values: list[int | None] = []
-    for line in result.stdout.strip().splitlines():
-        line = line.strip()
-        if line and line != "None":
-            try:
-                values.append(int(line))
-            except ValueError:
-                values.append(None)
-        else:
-            values.append(None)
-    return values
-
-_gpu_memory_cache: list[int | None] | None = None
-
-def _detect_gpu_memory_linux() -> list[int | None]:
-    """Detect VRAM for all GPUs on Linux via nvidia-smi and rocm-smi."""
-    values: list[int | None] = []
-    # Try NVIDIA
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        values.append(int(line) * 1024 * 1024)  # MiB to bytes
-                    except ValueError:
-                        values.append(None)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    # Try AMD ROCm
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showmeminfo", "vram"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                # "GPU[0]  : VRAM Total Memory (B): 17163091968"
-                match = re.search(r"VRAM Total Memory \(B\):\s*(\d+)", line)
-                if match:
-                    values.append(int(match.group(1)))
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return values
-
-def detect_device_memory(gpu: bool, device: int) -> int | None:
-    """Detect memory in bytes for the target device. Returns None if unknown."""
-    global _gpu_memory_cache
-    try:
-        if gpu:
-            if _gpu_memory_cache is None:
-                if sys.platform == "win32":
-                    _gpu_memory_cache = _detect_gpu_memory_windows()
-                else:
-                    _gpu_memory_cache = _detect_gpu_memory_linux()
-            if device < len(_gpu_memory_cache):
-                return _gpu_memory_cache[device]
-            return None
-        else:
-            if sys.platform == "win32":
-                result = subprocess.run(
-                    ["powershell", "-Command",
-                     "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                return int(result.stdout.strip())
-            else:
-                return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, subprocess.TimeoutExpired, AttributeError):
-        pass
-    return None
-
-def select_best_gguf(repo_id: str, memory_budget: int | None, kv_cache_reserve: int = 0) -> tuple[list[str], int]:
-    """Auto-select the best GGUF for the device. Returns (filenames, total_bytes).
-    kv_cache_reserve: bytes to reserve for KV cache and other runtime overhead."""
-    from huggingface_hub import HfApi
-
-    info = HfApi().model_info(repo_id, files_metadata=True)
-    gguf_files = [
-        (s.rfilename, s.size or 0)
-        for s in info.siblings
-        if s.rfilename.endswith(".gguf")
-    ]
-
-    if not gguf_files:
-        raise ValueError(f"No .gguf files found in {repo_id}")
-
-    # Group split files by base name
-    groups: dict[str, list[tuple[str, int]]] = {}
-    for filename, size in gguf_files:
-        base = re.sub(r'-\d{5}-of-\d{5}\.gguf$', '.gguf', filename)
-        groups.setdefault(base, []).append((filename, size))
-
-    candidates = [
-        (base, sum(s for _, s in files), len(files) == 1, files)
-        for base, files in groups.items()
-    ]
-
-    if memory_budget is not None:
-        # Reserve space for KV cache, GPU API overhead, and embedding model
-        budget = int(memory_budget * 0.6) - kv_cache_reserve
-        fitting = [c for c in candidates if c[1] <= budget]
-        if fitting:
-            # Largest model that fits = best quality; prefer single files as tiebreaker
-            fitting.sort(key=lambda c: (-c[1], not c[2]))
-            chosen = fitting[0]
-        else:
-            # Nothing fits — pick smallest
-            candidates.sort(key=lambda c: (c[1], not c[2]))
-            chosen = candidates[0]
-    else:
-        # Memory unknown — fall back to quant preference
-        def quant_rank(base: str) -> int:
-            lower = base.lower()
-            for i, quant in enumerate(gguf_quant_preference):
-                if quant in lower:
-                    return i
-            return len(gguf_quant_preference)
-
-        single = [c for c in candidates if c[2]]
-        pool = single if single else candidates
-        chosen = min(pool, key=lambda c: quant_rank(c[0]))
-
-    base, total_size, is_single, files = chosen
-
-    sorted_files = sorted(f[0] for f in files)
-    return sorted_files, total_size
-
-def _resolve_gpu_layers(gpu: bool, gpu_layers: int | None, device: int, model_size: int | None = None) -> int:
-    """Compute n_gpu_layers for llama.cpp."""
-    if not gpu:
-        return 0
-    if gpu_layers is not None:
-        return gpu_layers
-    if model_size:
-        vram = detect_device_memory(True, device)
-        if vram:
-            return int(100 * vram * 0.6 / model_size)
-    return -1
-
-def _estimate_model_size(local: str, local_file: str | None, gpu: bool, device: int, n_ctx: int) -> int | None:
-    """Estimate model file size in bytes without loading. Returns None if unknown."""
-    is_local_file = os.path.exists(local) or "\\" in local or local.count("/") > 1
-    if is_local_file:
-        return os.path.getsize(local)
-    if local_file is None:
-        try:
-            memory_budget = detect_device_memory(gpu, device)
-            kv_cache_reserve = n_ctx * 128 * 2 + int(1e9)
-            _, model_size = select_best_gguf(local, memory_budget, kv_cache_reserve)
-            return model_size
-        except Exception:
-            return None
-    return None
-
-def _create_local_model(local: str, local_file: str | None, gpu: bool, device: int, gpu_layers: int | None, n_ctx: int, debug: bool) -> object:
-    from llama_cpp import Llama
-
-    is_local_file = os.path.exists(local) or "\\" in local or local.count("/") > 1
-
-    if is_local_file:
-        model_size = os.path.getsize(local)
-        n_gpu_layers = _resolve_gpu_layers(gpu, gpu_layers, device, model_size)
-        print(f"Local model: {local} ({'GPU ' + str(device) if gpu else 'CPU'})")
-        return Llama(
-            model_path = local,
-            n_gpu_layers = n_gpu_layers,
-            n_ctx = n_ctx,
-            verbose = debug,
-        )
-    else:
-        if local_file is None:
-            memory_budget = detect_device_memory(gpu, device)
-            # Reserve ~2 bytes per token per layer for KV cache, plus 1GB for runtime overhead.
-            # Conservative estimate: 128 layers (covers up to ~70B models).
-            kv_cache_reserve = n_ctx * 128 * 2 + int(1e9)
-            print(f"Querying HuggingFace for available quantizations...", flush=True)
-            local_files, model_size = select_best_gguf(local, memory_budget, kv_cache_reserve)
-            n_gpu_layers = _resolve_gpu_layers(gpu, gpu_layers, device, model_size)
-            print(f"Local model: {local} (auto-selected: {local_files[0]}, {model_size / 1e9:.1f} GB, {'GPU ' + str(device) if gpu else 'CPU'})")
-        else:
-            local_files = [case_insensitive_glob(local_file)]
-            n_gpu_layers = _resolve_gpu_layers(gpu, gpu_layers, device)
-            print(f"Local model: {local} (file: {local_files[0]}, {'GPU ' + str(device) if gpu else 'CPU'})")
-        return Llama.from_pretrained(
-            repo_id = local,
-            filename = local_files[0],
-            additional_files = local_files[1:] or None,
-            n_gpu_layers = n_gpu_layers,
-            n_ctx = n_ctx,
-            verbose = debug,
-        )
-
-def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
-    aspects: list[Aspect] = []
-
-    if local is not None:
-        if gpu:
-            model_size = _estimate_model_size(local, local_file, True, devices[0], n_ctx)
-            for device in devices:
-                vram = detect_device_memory(True, device)
-                if model_size is not None and vram is not None and vram < model_size:
-                    print(f"Skipping GPU {device}: insufficient VRAM ({vram / 1e9:.1f} GB) for model ({model_size / 1e9:.1f} GB)")
-                    continue
-                try:
-                    model = _create_local_model(local, local_file, True, device, gpu_layers, n_ctx, debug)
-                except (ValueError, RuntimeError) as e:
-                    print(f"Skipping GPU {device}: failed to load model ({e})")
-                    continue
-                aspects.append(Aspect(
-                    name = f"local/gpu:{device}",
-                    cli_command = None,
-                    local_model = model,
-                    local_n_ctx = model.n_ctx(),
-                    openai_client = None,
-                    openai_model = None,
-                ))
-            if cpu:
-                model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
-                aspects.append(Aspect(
-                    name = "local/cpu",
-                    cli_command = None,
-                    local_model = model,
-                    local_n_ctx = model.n_ctx(),
-                    openai_client = None,
-                    openai_model = None,
-                ))
-        else:
-            model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
-            aspects.append(Aspect(
-                name = "local/cpu",
-                cli_command = None,
-                local_model = model,
-                local_n_ctx = model.n_ctx(),
-                openai_client = None,
-                openai_model = None,
-            ))
-
-    if cli_command is not None:
-        print(f"CLI tool: {shlex.join(cli_command)} (concurrency {concurrency})")
-        for i in range(concurrency):
-            aspects.append(Aspect(
-                name = f"cli/{i}",
-                cli_command = cli_command,
-                local_model = None,
-                local_n_ctx = None,
-                openai_client = None,
-                openai_model = None,
-            ))
-
-    if openai_model is not None:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI()
-        print(f"OpenAI model: {openai_model} (concurrency {concurrency})")
-        for i in range(concurrency):
-            aspects.append(Aspect(
-                name = f"openai/{i}",
-                cli_command = None,
-                local_model = None,
-                local_n_ctx = None,
-                openai_client = client,
-                openai_model = openai_model,
-            ))
-
-    if not aspects:
-        raise SystemExit("Error: no inference backends available. All GPU devices were skipped or failed to load.")
-
-    openai_client_for_embed = None
-    if openai_embedding_model is not None:
-        from openai import AsyncOpenAI
-        openai_client_for_embed = AsyncOpenAI()
-        print(f"OpenAI embedding model: {openai_embedding_model}")
-        embedding = None
-        if batch_size is None:
-            batch_size = 256
-    else:
-        if gpu:
-            device = devices[0]
-            providers = [("DmlExecutionProvider", {"device_id": device})]
-            if cpu_offload:
-                providers.append("CPUExecutionProvider")
-        else:
-            providers = ["CPUExecutionProvider"]
-        if batch_size is None:
-            batch_size = 32 if gpu else 256
-        print(f"Loading embedding model ({embedding_model}, batch size {batch_size})...")
-        embedding = TextEmbedding(model_name = embedding_model, providers = providers)
-    print(f"Initialized {len(aspects)} aspect{'s' if len(aspects) != 1 else ''}: {', '.join(a.name for a in aspects)}")
-    return Facets(
-        repository = repository,
-        model_identity = model_identity,
-        pool = AspectPool(aspects),
-        embedding_model = embedding,
-        embedding_model_name = embedding_model,
-        gpu = gpu,
-        batch_size = batch_size,
-        timeout = timeout,
-        debug = debug,
-        openai_client = openai_client_for_embed,
-        openai_embedding_model = openai_embedding_model,
-    )
-
-def extract_json(text: str) -> str:
-    """Extract JSON from text that may contain code fences or surrounding text."""
-    match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        return match.group(0)
-    return text.strip()
-
-def repair_json(text: str) -> str:
-    """Fix invalid escape sequences in JSON strings."""
-    # Fix \X where X is not a valid JSON escape character
-    text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
-    # Fix \uXXXX where XXXX aren't all hex digits (e.g. \utils)
-    text = re.sub(r'\\u(?![0-9a-fA-F]{4})', r'\\\\u', text)
-    return text
-
-def _build_labels_schema(count: int | None) -> dict:
-    """Build a JSON schema for Labels with optional exact item count."""
-    label_schema = {
-        "type": "object",
-        "properties": {
-            "overarchingTheme": {"type": "string"},
-            "distinguishingFeature": {"type": "string"},
-            "label": {"type": "string"},
-        },
-        "required": ["overarchingTheme", "distinguishingFeature", "label"],
-    }
-    array_schema: dict = {"type": "array", "items": label_schema}
-    if count is not None:
-        array_schema["minItems"] = count
-        array_schema["maxItems"] = count
-    return {
-        "type": "object",
-        "properties": {"labels": array_schema},
-        "required": ["labels"],
-    }
-
-def _local_complete(model: object, prompt: str, response_format: dict | None = None) -> str:
-    kwargs: dict = {
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "max_tokens": 4096,
-    }
-    if response_format is not None:
-        kwargs["response_format"] = response_format
-    result = model.create_chat_completion(**kwargs)
-    return result["choices"][0]["message"]["content"]
-
-max_retries = 60
-max_count_retries = 5
-
-async def complete(facets: Facets, prompt: str, output_type: type[T], progress: tqdm | None = None, expected_count: int | None = None) -> T:
-    """Run CLI tool or local model with prompt, parse JSON response into Pydantic model."""
-    for attempt in range(max_retries):
-        if facets.debug:
-            print(f"\n[debug] prompt ({len(prompt)} chars):\n{prompt[:500]}{'...' if len(prompt) > 500 else ''}")
-        aspect = await facets.pool.acquire()
-        release_aspect = True
-        try:
-            if aspect.openai_client is not None:
-                response = await aspect.openai_client.responses.parse(
-                    model = aspect.openai_model,
-                    input = prompt,
-                    text_format = output_type,
-                )
-                if response.output_parsed is not None:
-                    parsed = response.output_parsed
-                    if expected_count is not None and hasattr(parsed, 'labels') and len(parsed.labels) != expected_count:
-                        if len(parsed.labels) > expected_count:
-                            tqdm.write(f"[{aspect.name}] Truncating {len(parsed.labels)} → {expected_count} labels")
-                            parsed.labels = parsed.labels[:expected_count]
-                        elif attempt < max_count_retries - 1:
-                            tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(parsed.labels)}")
-                            continue
-                        else:
-                            tqdm.write(f"Padding {len(parsed.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
-                            while len(parsed.labels) < expected_count:
-                                parsed.labels.append(Label(
-                                    overarchingTheme = "Miscellaneous",
-                                    distinguishingFeature = "Ungrouped",
-                                    label = "Miscellaneous",
-                                ))
-                    if progress is not None:
-                        progress.update(1)
-                    return parsed
-                else:
-                    if attempt < max_retries - 1:
-                        tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: OpenAI returned no parsed output")
-                        continue
-                    raise RuntimeError("OpenAI returned no parsed output")
-            elif aspect.local_model is not None:
-                response_format = None
-                if expected_count is not None:
-                    response_format = {
-                        "type": "json_object",
-                        "schema": _build_labels_schema(expected_count),
-                    }
-                loop = asyncio.get_running_loop()
-                try:
-                    raw = await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt, response_format)
-                except (OSError, RuntimeError) as e:
-                    # Local model crash — permanently remove this aspect
-                    release_aspect = False
-                    remaining = [a for a in facets.pool.aspects if a is not aspect]
-                    if not remaining:
-                        raise SystemExit(f"All inference backends have failed. Last error: {e}")
-                    facets.pool.aspects = remaining
-                    tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({len(remaining)} remaining)")
-                    if attempt < max_retries - 1:
-                        continue
-                    raise
-            else:
-                if facets.debug:
-                    cmd = shlex.join(aspect.cli_command)
-                    print(f"[debug] command: {cmd}")
-                loop = asyncio.get_running_loop()
-                cli_result = await loop.run_in_executor(None, lambda: subprocess.run(
-                    aspect.cli_command,
-                    input=prompt.encode(),
-                    capture_output=True,
-                    timeout=facets.timeout,
-                ))
-                raw = cli_result.stdout.decode()
-                if facets.debug:
-                    print(f"[debug] exit code: {cli_result.returncode}")
-                    print(f"[debug] stdout ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
-                    if cli_result.stderr:
-                        print(f"[debug] stderr: {cli_result.stderr.decode()[:500]}")
-                if cli_result.returncode != 0:
-                    # CLI non-zero exit is transient — retry with same aspect
-                    tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: CLI exit {cli_result.returncode}")
-                    if attempt < max_retries - 1:
-                        continue
-                    raise RuntimeError(
-                        f"CLI command failed (exit {cli_result.returncode}): {cli_result.stderr.decode()}"
-                    )
-        finally:
-            if release_aspect:
-                facets.pool.release(aspect)
-        if facets.debug:
-            print(f"[debug] raw output ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
-        extracted = extract_json(raw)
-        if facets.debug:
-            print(f"[debug] extracted JSON: {extracted[:500]}{'...' if len(extracted) > 500 else ''}")
-        try:
-            parsed = output_type.model_validate_json(extracted)
-        except Exception:
-            repaired = repair_json(extracted)
-            if facets.debug:
-                print(f"[debug] repaired JSON: {repaired[:500]}{'...' if len(repaired) > 500 else ''}")
-            try:
-                parsed = output_type.model_validate_json(repaired)
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: parse error: {e}")
-                    continue
-                raise
-        if expected_count is not None and hasattr(parsed, 'labels') and len(parsed.labels) != expected_count:
-            if len(parsed.labels) > expected_count:
-                tqdm.write(f"[{aspect.name}] Truncating {len(parsed.labels)} → {expected_count} labels")
-                parsed.labels = parsed.labels[:expected_count]
-            elif attempt < max_count_retries - 1:
-                tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(parsed.labels)}")
-                continue
-            else:
-                # Pad with generic labels rather than retrying forever
-                tqdm.write(f"Padding {len(parsed.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
-                while len(parsed.labels) < expected_count:
-                    parsed.labels.append(Label(
-                        overarchingTheme = "Miscellaneous",
-                        distinguishingFeature = "Ungrouped",
-                        label = "Miscellaneous",
-                    ))
-        if progress is not None:
-            progress.update(1)
-        return parsed
-
-class Label(BaseModel):
-    overarchingTheme: str
-    distinguishingFeature: str
-    label: str
-
-class Labels(BaseModel):
-    labels: list[Label]
-
-def app_cache_dir() -> Path:
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    else:
-        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return base / "semantic-navigator"
-
-def _sanitize_path(path: str) -> str:
-    """Turn an absolute path into a safe directory name."""
-    resolved = os.path.realpath(path)
-    return resolved.replace("\\", "--").replace("/", "--").replace(":", "")
-
-def repo_cache_dir(repository: str) -> Path:
-    return app_cache_dir() / "repos" / _sanitize_path(repository)
-
-def content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode()).hexdigest()
-
-def embedding_cache_dir(model_name: str) -> Path:
-    return app_cache_dir() / "embeddings" / model_name.replace("/", "--")
-
-def list_cached_keys(directory: Path, suffix: str) -> set[str]:
-    """List all cached keys in a directory by stripping the suffix from filenames."""
-    if not directory.exists():
-        return set()
-    return {p.stem for p in directory.iterdir() if p.suffix == suffix}
-
-def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
-    path = directory / f"{key}.npy"
-    if path.exists():
-        return numpy.load(path).astype(float32)
-    return None
-
-def save_cached_embedding(directory: Path, key: str, embedding: NDArray[float32]) -> None:
-    directory.mkdir(parents = True, exist_ok = True)
-    numpy.save(directory / f"{key}.npy", embedding)
-
-def label_cache_dir(repository: str, model_identity: str) -> Path:
-    safe_id = hashlib.sha256(model_identity.encode()).hexdigest()[:16]
-    return repo_cache_dir(repository) / "labels" / safe_id
-
-def load_cached_label(directory: Path, key: str) -> Label | None:
-    path = directory / f"{key}.json"
-    if path.exists():
-        return Label.model_validate_json(path.read_text())
-    return None
-
-def save_cached_label(directory: Path, key: str, label: Label) -> None:
-    directory.mkdir(parents = True, exist_ok = True)
-    path = directory / f"{key}.json"
-    path.write_text(label.model_dump_json())
-
-def cluster_hash(files: list[str]) -> str:
-    """Stable hash for a cluster based on its sorted file list."""
-    return hashlib.sha256("\n".join(sorted(files)).encode()).hexdigest()
-
-def load_cached_cluster_labels(directory: Path, key: str) -> Labels | None:
-    path = directory / f"cluster-{key}.json"
-    if path.exists():
-        try:
-            return Labels.model_validate_json(path.read_text())
-        except Exception:
-            return None
-    return None
-
-def save_cached_cluster_labels(directory: Path, key: str, labels: Labels) -> None:
-    directory.mkdir(parents = True, exist_ok = True)
-    path = directory / f"cluster-{key}.json"
-    path.write_text(labels.model_dump_json())
-
-@dataclass(frozen = True)
-class Embed:
-    entry: str
-    content: str
-    embedding: NDArray[float32]
-
-@dataclass(frozen = True)
-class Cluster:
-    embeds: list[Embed]
-
-async def embed(facets: Facets, directory: str) -> Cluster:
-    try:
-        repo = Repo.discover(directory)
-
-        def generate_paths() -> Iterable[str]:
-            for bytestring in repo.open_index().paths():
-                path = bytestring.decode("utf-8")
-
-                subdirectory = PurePath(directory).relative_to(repo.path)
-
-                try:
-                    relative_path = PurePath(path).relative_to(subdirectory)
-
-                    yield str(relative_path)
-                except ValueError:
-                    pass
-
-    except NotGitRepository:
-        def generate_paths() -> Iterable[str]:
-            for entry in os.scandir(directory):
-                if entry.is_file(follow_symlinks = False):
-                    yield entry.path
-
-    async def read(path) -> tuple[str, str] | None:
-        try:
-            absolute_path = os.path.join(directory, path)
-
-            async with aiofiles.open(absolute_path, "rb") as handle:
-                bytestring = await handle.read()
-
-                text = bytestring.decode("utf-8")
-
-                return (path, f"{path}:\n\n{text}")
-
-        except UnicodeDecodeError:
-            # Ignore files that aren't UTF-8
-            return None
-
-        except IsADirectoryError:
-            # This can happen when a "file" listed by the repository is:
-            #
-            # - a submodule
-            # - a symlink to a directory
-            #
-            # TODO: The submodule case can and should be fixed and properly
-            # handled
-            return None
-
-    tasks = tqdm_asyncio.gather(
-        *(read(path) for path in generate_paths()),
-        desc = "Reading files",
-        unit = "file",
-        leave = False
-    )
-
-    results = [ result for result in await tasks if result is not None ]
-
-    if not results:
-        return Cluster([])
-
-    paths, contents = zip(*results)
-
-    cdir = embedding_cache_dir(facets.embedding_model_name)
-    cached_emb_keys = list_cached_keys(cdir, ".npy")
-    embeddings: list[NDArray[float32]] = [None] * len(contents)  # type: ignore[list-item]
-    uncached_indices = []
-
-    for i, content in enumerate(contents):
-        key = content_hash(content)
-        if key in cached_emb_keys:
-            embeddings[i] = load_cached_embedding(cdir, key)
-        else:
-            uncached_indices.append(i)
-
-    n_cached = len(contents) - len(uncached_indices)
-    if n_cached > 0:
-        print(f"Embeddings: {n_cached}/{len(contents)} cached, {len(uncached_indices)} to compute")
-
-    if uncached_indices:
-        uncached_contents = [contents[i] for i in uncached_indices]
-
-        if facets.openai_client is not None:
-            # OpenAI embedding with token-aware chunking
-            import tiktoken
-            try:
-                encoding = tiktoken.encoding_for_model(facets.openai_embedding_model)
-            except KeyError:
-                encoding = tiktoken.get_encoding("cl100k_base")
-
-            max_tokens_per_embed = 8192
-            max_embeds_per_batch = 2048
-
-            # Truncate content to fit token limit
-            truncated_contents = []
-            for content in uncached_contents:
-                tokens = encoding.encode(content)
-                if len(tokens) > max_tokens_per_embed:
-                    tokens = tokens[:max_tokens_per_embed]
-                    truncated_contents.append(encoding.decode(tokens))
-                else:
-                    truncated_contents.append(content)
-
-            async def openai_embed_batch(batch: list[str]) -> list[NDArray[float32]]:
-                response = await facets.openai_client.embeddings.create(
-                    model = facets.openai_embedding_model,
-                    input = batch,
-                )
-                return [numpy.asarray(datum.embedding, float32) for datum in response.data]
-
-            from itertools import batched
-            batches = list(batched(truncated_contents, max_embeds_per_batch))
-            new_embeddings_nested = await tqdm_asyncio.gather(
-                *(openai_embed_batch(list(batch)) for batch in batches),
-                desc = f"Embedding contents ({len(uncached_indices)} uncached)",
-                unit = "batch",
-                leave = False,
-            )
-            new_embeddings = [e for batch_result in new_embeddings_nested for e in batch_result]
-        else:
-            def do_embed(model: TextEmbedding, desc: str) -> list[NDArray[float32]]:
-                return [
-                    numpy.asarray(e, float32)
-                    for e in tqdm(
-                        model.embed(uncached_contents, batch_size = facets.batch_size),
-                        desc = desc,
-                        unit = "file",
-                        total = len(uncached_contents),
-                        leave = False
-                    )
-                ]
-
-            try:
-                new_embeddings = do_embed(facets.embedding_model, f"Embedding contents ({len(uncached_indices)} uncached)")
-            except Exception as e:
-                if not facets.gpu:
-                    raise
-                print(f"\nGPU embedding failed ({e}), falling back to CPU...")
-                cpu_model = TextEmbedding(model_name = facets.embedding_model_name, providers = ["CPUExecutionProvider"])
-                new_embeddings = do_embed(cpu_model, "Embedding contents (CPU)")
-
-        for i, embedding in zip(uncached_indices, new_embeddings):
-            embeddings[i] = embedding
-            save_cached_embedding(cdir, content_hash(contents[i]), embedding)
-
-    embeds = [
-        Embed(path, content, embedding)
-        for path, content, embedding in zip(paths, contents, embeddings)
-    ]
-
-    return Cluster(embeds)
-
-# The clustering algorithm can go as low as 1 here, but we set it higher for
-# two reasons:
-#
-# - it's easier for users to navigate when there is more branching at the
-#   leaves
-# - this also avoids straining the tree visualizer, which doesn't like a really
-#   deeply nested tree structure.
-max_leaves = 20
-
-def cluster(input: Cluster) -> list[Cluster]:
-    N = len(input.embeds)
-
-    if N <= max_leaves:
-        return [input]
-
-    entries, contents, embeddings = zip(*(
-        (embed.entry, embed.content, embed.embedding)
-        for embed in input.embeds
-    ))
-
-    # The following code computes an affinity matrix using a radial basis
-    # function with an adaptive σ.  See:
-    #
-    #     L. Zelnik-Manor, P. Perona (2004), "Self-Tuning Spectral Clustering"
-
-    normalized = sklearn.preprocessing.normalize(embeddings)
-
-    # The original paper suggests setting K (`n_neighbors`) to 7.  Here we do
-    # something a little fancier and try to find a low value of `n_neighbors`
-    # that produces one connected component.  This usually ends up being around
-    # 7 anyway.
-    #
-    # The reason we want to avoid multiple connected components is because if
-    # we have more than one connected component then those connected components
-    # will dominate the clusters suggested by spectral clustering.  We don't
-    # want that because we don't want spectral clustering to degenerate to the
-    # same result as K nearest neighbors.  We want the K nearest neighbors
-    # algorithm to weakly inform the spectral clustering algorithm without
-    # dominating the result.
-    def get_nearest_neighbors(n_neighbors: int) -> tuple[int, int, NearestNeighbors]:
-        nearest_neighbors = NearestNeighbors(
-            n_neighbors = n_neighbors,
-            metric = "cosine",
-            n_jobs = -1
-        ).fit(normalized)
-
-        graph = nearest_neighbors.kneighbors_graph(
-            mode = "connectivity"
-        )
-
-        n_components, _ = scipy.sparse.csgraph.connected_components(
-            graph,
-            directed = False
-        )
-
-        return n_components, n_neighbors, nearest_neighbors
-
-    # We don't attempt to find the absolute lowest value of K (`n_neighbors`).
-    # Instead we just sample a few values and pick a "small enough" one.
-    candidate_neighbor_counts = list(itertools.takewhile(
-        lambda x: x < N,
-        (round(math.exp(n)) for n in itertools.count())
-    )) + [ math.floor(N / 2) ]
-
-    results = [
-        get_nearest_neighbors(n_neighbors)
-        for n_neighbors in candidate_neighbor_counts
-    ]
-
-    # Find the first sample value of K (`n_neighbors`) that produces one
-    # connected component.  There's guaranteed to be at least one since the
-    # very last value we sample (⌊N/2⌋) always produces one connected
-    # component.
-    n_neighbors, nearest_neighbors = [
-        (n_neighbors, nearest_neighbors)
-        for n_components, n_neighbors, nearest_neighbors in results
-        if n_components == 1
-    ][0]
-
-    distances, indices = nearest_neighbors.kneighbors()
-
-    # sigmas[i] = the distance of semantic embedding #i to its Kth nearest
-    # neighbor
-    sigmas = distances[:, -1]
-
-    rows    = numpy.repeat(numpy.arange(N), n_neighbors)
-    columns = indices.reshape(-1)
-
-    d = distances.reshape(-1)
-
-    sigma_i = numpy.repeat(sigmas, n_neighbors)
-    sigma_j = sigmas[columns]
-
-    denominator = numpy.maximum(sigma_i * sigma_j, 1e-12)
-    data = numpy.exp(-(d * d) / denominator).astype(numpy.float32)
-
-    # Affinity: A_ij = exp(-d(x_i, x_j)^2 / (σ_i σ_j))
-    affinity = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
-
-    affinity = (affinity + affinity.T) * 0.5
-    affinity.setdiag(1.0)
-    affinity.eliminate_zeros()
-
-    # The following code is basically `sklearn.manifold.spectral_embeddings`,
-    # but exploded out so that we can get access to the eigenvalues, which are
-    # normally not exposed by the function.  We'll need those eigenvalues
-    # later.
-    random_state = sklearn.utils.check_random_state(0)
-
-    laplacian, dd = scipy.sparse.csgraph.laplacian(
-        affinity,
-        normed = True,
-        return_diag = True
-    )
-
-    # laplacian = set_diag(laplacian, 1, True)
-    laplacian = laplacian.tocoo()
-    laplacian.data[laplacian.row == laplacian.col] = 1
-    laplacian = laplacian.tocsr()
-
-    laplacian *= -1
-    v0 = random_state.uniform(-1, 1, N)
-
-    if max_clusters + 1 < N:
-        k = max_clusters + 1
-
-        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            laplacian,
-            k = k,
-            sigma = 1.0,
-            which = 'LM',
-            tol = 0.0,
-            v0 = v0
-        )
-    else:
-        k = N
-
-        eigenvalues, eigenvectors = scipy.linalg.eigh(
-            laplacian.toarray(),
-            check_finite = False
-        )
-
-    indices = numpy.argsort(eigenvalues)[::-1]
-
-    eigenvalues = eigenvalues[indices]
-
-    eigenvectors = eigenvectors[:, indices]
-
-    wide_spectral_embeddings = eigenvectors.T / dd
-    wide_spectral_embeddings = sklearn.utils.extmath._deterministic_vector_sign_flip(wide_spectral_embeddings)
-    wide_spectral_embeddings = wide_spectral_embeddings[1:k].T
-    eigenvalues = eigenvalues * -1
-
-    # Find the optimal cluster count by looking for the largest eigengap
-    #
-    # The reason the suggested cluster count is not just:
-    #
-    #     numpy.argmax(numpy.diff(eigenvalues)) + 1
-    #
-    # … is because we want at least two clusters
-    n_clusters = numpy.argmax(numpy.diff(eigenvalues[1:])) + 2
-
-    spectral_embeddings = wide_spectral_embeddings[:, :n_clusters]
-
-    spectral_embeddings = sklearn.preprocessing.normalize(spectral_embeddings)
-
-    labels = sklearn.cluster.KMeans(
-        n_clusters = n_clusters,
-        random_state = 0,
-        n_init = "auto"
-    ).fit_predict(spectral_embeddings)
-
-    groups = collections.OrderedDict()
-
-    for (label, entry, content, embedding) in zip(labels, entries, contents, embeddings):
-        groups.setdefault(label, []).append(Embed(entry, content, embedding))
-
-    return [ Cluster(embeds) for embeds in groups.values() ]
-
-@dataclass(frozen = True)
-class ClusterTree:
-    node: Cluster
-    children: list["ClusterTree"]
-
-def _count_tree_depth(ct: ClusterTree) -> int:
-    if not ct.children:
-        return 0
-    return 1 + max(_count_tree_depth(c) for c in ct.children)
-
-def _count_tree_leaves(ct: ClusterTree) -> int:
-    if not ct.children:
-        return 1
-    return sum(_count_tree_leaves(c) for c in ct.children)
-
-def build_cluster_tree(c: Cluster) -> ClusterTree:
-    children = cluster(c)
-    if len(children) == 1:
-        return ClusterTree(c, [])
-    else:
-        return ClusterTree(c, [build_cluster_tree(child) for child in children])
-
-@dataclass(frozen = True)
-class Tree:
-    label: str
-    files: list[str]
-    children: list["Tree"]
-
-def to_pattern(files: list[str]) -> str:
-    prefix = os.path.commonprefix(files)
-    suffix = os.path.commonprefix([ file[len(prefix):][::-1] for file in files ])[::-1]
-
-    if suffix:
-        if any([ file[len(prefix):-len(suffix)] for file in files ]):
-            star = "*"
-        else:
-            star = ""
-    else:
-        if any([ file[len(prefix):] for file in files ]):
-            star = "*"
-        else:
-            star = ""
-
-    if prefix:
-        if suffix:
-            return f"{prefix}{star}{suffix}: "
-        else:
-            return f"{prefix}{star}: "
-    else:
-        if suffix:
-            return f"{star}{suffix}: "
-        else:
-            return ""
-
-def to_files(trees: list[Tree]) -> list[str]:
-    return [ file for tree in trees for file in tree.files ]
-
-def count_cached_labels(ct: ClusterTree, repository: str, model_identity: str, cached_keys: set[str] | None = None) -> tuple[int, int, int]:
-    """Count cached vs uncached file labels in the tree.
-    Returns (uncached_files, cached_files, cached_clusters)."""
-    if cached_keys is None:
-        cached_keys = list_cached_keys(label_cache_dir(repository, model_identity), ".json")
-    if not ct.children:
-        uncached = sum(
-            1 for embed in ct.node.embeds
-            if content_hash(embed.content) not in cached_keys
-        )
-        cached = len(ct.node.embeds) - uncached
-        return (uncached, cached, 0)
-    else:
-        total_uncached = 0
-        total_cached = 0
-        total_cached_clusters = 0
-        for child in ct.children:
-            uncached, cached, cc = count_cached_labels(child, repository, model_identity, cached_keys)
-            total_uncached += uncached
-            total_cached += cached
-            total_cached_clusters += cc
-        # Check if this cluster node itself is cached
-        all_files = [e.entry for e in ct.node.embeds]
-        c_key = "cluster-" + cluster_hash(all_files)
-        if c_key in cached_keys:
-            total_cached_clusters += 1
-        return (total_uncached, total_cached, total_cached_clusters)
-
-async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
-    if not ct.children:
-        ldir = label_cache_dir(facets.repository, facets.model_identity)
-        cached_labels: dict[int, Label] = {}
-        uncached_embeds: list[tuple[int, Embed]] = []
-
-        for i, embed in enumerate(ct.node.embeds):
-            cached = load_cached_label(ldir, content_hash(embed.content))
-            if cached is not None:
-                cached_labels[i] = cached
-            else:
-                uncached_embeds.append((i, embed))
-
-        if uncached_embeds:
-            # Split into batches for local models to avoid exceeding context window
-            if facets.pool.min_local_n_ctx is not None:
-                # ~1.5 chars per token for code, reserve 4096 tokens for response,
-                # 1000 chars for prompt instructions/schema overhead
-                max_chars = max(int((facets.pool.min_local_n_ctx - 4096) * 1.5) - 1000, 1000)
-
-                def render_embed(embed: Embed) -> str:
-                    content = embed.content
-                    if len(content) > max_chars:
-                        content = content[:max_chars] + "\n... (truncated)"
-                    return f"# File: {embed.entry}\n\n{content}"
-
-                batches: list[list[tuple[int, Embed]]] = []
-                batch: list[tuple[int, Embed]] = []
-                batch_size = 0
-                for item in uncached_embeds:
-                    size = min(len(item[1].content), max_chars) + len(item[1].entry) + 20
-                    if batch and batch_size + size > max_chars:
-                        batches.append(batch)
-                        batch = [item]
-                        batch_size = size
-                    else:
-                        batch.append(item)
-                        batch_size += size
-                if batch:
-                    batches.append(batch)
-            else:
-                def render_embed(embed: Embed) -> str:
-                    return f"# File: {embed.entry}\n\n{embed.content}"
-
-                batches = [uncached_embeds]
-
-            batch_sizes = [len(b) for b in batches]
-            tqdm.write(f"  Leaf: {len(uncached_embeds)} files in {len(batches)} batch{'es' if len(batches) != 1 else ''} (avg {sum(batch_sizes)/len(batch_sizes):.1f} files/batch)")
-
-            schema = json.dumps(Labels.model_json_schema(), indent=2)
-
-            async def process_batch(batch: list[tuple[int, Embed]]) -> None:
-                rendered_embeds = "\n\n".join([ render_embed(embed) for _, embed in batch ])
-
-                prompt = (
-                    f"Label each file in 3 to 7 words. Don't include file path/names in descriptions.\n"
-                    f"Return exactly {len(batch)} label{'s' if len(batch) != 1 else ''}, one per file.\n\n"
-                    f"{rendered_embeds}\n\n"
-                    f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
-                )
-
-                result = await complete(facets, prompt, Labels, progress, expected_count=len(batch))
-
-                for (i, embed), label in zip(batch, result.labels):
-                    cached_labels[i] = label
-                    # Save each file label immediately so progress survives crashes
-                    save_cached_label(ldir, content_hash(embed.content), label)
-
-            await asyncio.gather(*(process_batch(batch) for batch in batches))
-
-        return [
-            Tree(
-                f"{embed.entry}: {cached_labels[i].label}" if i in cached_labels else embed.entry,
-                [ embed.entry ],
-                [],
-            )
-            for i, embed in enumerate(ct.node.embeds)
-        ]
-
-    else:
-        treess = await asyncio.gather(
-            *(label_nodes(facets, child, progress) for child in ct.children),
-        )
-
-        # Check cluster label cache
-        ldir = label_cache_dir(facets.repository, facets.model_identity)
-        all_files = [f for trees in treess for tree in trees for f in tree.files]
-        c_key = cluster_hash(all_files)
-        cached_cluster = load_cached_cluster_labels(ldir, c_key)
-
-        if cached_cluster is not None and len(cached_cluster.labels) == len(treess):
-            tqdm.write(f"  Cluster ({len(treess)} children): cached")
-            if progress is not None:
-                progress.update(1)
-            return [
-                Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
-                for label, trees in zip(cached_cluster.labels, treess)
-            ]
-
-        def render_cluster(trees: list[Tree]) -> str:
-            rendered_trees = "\n".join([ tree.label for tree in trees ])
-
-            return f"# Cluster\n\n{rendered_trees}"
-
-        rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
-
-        schema = json.dumps(Labels.model_json_schema(), indent=2)
-        prompt = (
-            f"Label each cluster in 2 words. Don't include file path/names in labels.\n"
-            f"Return exactly {len(treess)} label{'s' if len(treess) != 1 else ''}, one per cluster.\n\n"
-            f"{rendered_clusters}\n\n"
-            f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
-        )
-
-        labels = await complete(facets, prompt, Labels, progress, expected_count=len(treess))
-
-        # Cache cluster labels for crash recovery
-        save_cached_cluster_labels(ldir, c_key, labels)
-
-        return [
-            Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
-            for label, trees in zip(labels.labels, treess)
-        ]
-
-async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float] | None = None) -> Tree:
-    with timed("Clustering", timings):
-        ct = build_cluster_tree(c)
-    depth = _count_tree_depth(ct)
-    leaves = _count_tree_leaves(ct)
-    print(f"  {leaves} leaf clusters, depth {depth}")
-    uncached_files, cached_files, cached_clusters = count_cached_labels(ct, facets.repository, facets.model_identity)
-    total_files = cached_files + uncached_files
-    cache_parts = []
-    if cached_files > 0:
-        cache_parts.append(f"{cached_files}/{total_files} file labels")
-    if cached_clusters > 0:
-        cache_parts.append(f"{cached_clusters} cluster labels")
-    if cache_parts:
-        print(f"Cache: {', '.join(cache_parts)}", flush=True)
-    if uncached_files > 0:
-        print(f"Labeling {uncached_files} uncached files...", flush=True)
-    with timed("Labeling", timings):
-        with tqdm(desc = "Labeling", unit = "call", leave = False) as progress:
-            children = await label_nodes(facets, ct, progress)
-
-    return Tree(label, to_files(children), children)
 
 class UI(textual.app.App):
     BINDINGS = [("slash", "focus_search", "Search"), ("escape", "clear_search", "Clear")]
@@ -1383,6 +93,140 @@ class UI(textual.app.App):
     def on_input_changed(self, event: textual.widgets.Input.Changed):
         self._build_tree(event.value.strip().lower())
 
+
+def _handle_erase_models():
+    """Handle the --erase-models command."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+        if not cache_info.repos:
+            print("No downloaded models found.")
+            return
+        total_size = sum(r.size_on_disk for r in cache_info.repos)
+        print(f"Downloaded models ({total_size / 1e9:.1f} GB):")
+        for repo in sorted(cache_info.repos, key=lambda r: r.size_on_disk, reverse=True):
+            print(f"  {repo.repo_id} ({repo.size_on_disk / 1e9:.1f} GB)")
+        confirm = input("\nDelete all downloaded models? [y/N] ").strip().lower()
+        if confirm == "y":
+            delete_strategy = cache_info.delete_revisions(
+                [r.commit_hash for repo in cache_info.repos for r in repo.revisions]
+            )
+            delete_strategy.execute()
+            print("Done.")
+        else:
+            print("Aborted.")
+    except ImportError:
+        print("huggingface_hub is not installed.")
+
+
+def _flush_cache(repository: str):
+    """Delete cached labels for the given repository (preserves embeddings)."""
+    repo_dir = repo_cache_dir(repository)
+    if repo_dir.exists():
+        size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
+        shutil.rmtree(repo_dir)
+        print(f"Flushed repo cache for {repository} ({size / 1e6:.1f} MB)")
+    else:
+        print(f"No cache found.")
+
+
+def _show_status(repository: str, embedding_model: str):
+    """Show cache status for a repository."""
+    import os
+    from pathlib import Path
+
+    file_paths = _generate_paths(repository)
+
+    # Read files and compute content hashes
+    file_hashes: list[tuple[str, str]] = []  # (path, hash)
+    for path in file_paths:
+        try:
+            absolute_path = os.path.join(repository, path)
+            with open(absolute_path, "rb") as f:
+                text = f.read().decode("utf-8")
+            file_hashes.append((path, content_hash(f"{path}:\n\n{text}")))
+        except (UnicodeDecodeError, IsADirectoryError):
+            pass
+
+    total = len(file_hashes)
+    all_hashes = {h for _, h in file_hashes}
+
+    print(f"Repository: {repository} ({total} files)")
+    print()
+
+    # Embedding cache
+    emb_dir = embedding_cache_dir(embedding_model)
+    cached_emb_keys = list_cached_keys(emb_dir, ".npy")
+    emb_cached = sum(1 for _, h in file_hashes if h in cached_emb_keys)
+    emb_missing = total - emb_cached
+    print(f"Embeddings ({embedding_model}):")
+    print(f"  {emb_cached}/{total} cached ({emb_missing} missing)")
+    if emb_missing > 0:
+        print("  Missing:")
+        for path, h in file_hashes:
+            if h not in cached_emb_keys:
+                print(f"    {path}")
+    print()
+
+    # Label caches
+    repo_dir = repo_cache_dir(repository)
+    labels_dir = repo_dir / "labels"
+    if not labels_dir.exists():
+        print("Labels: no label caches found")
+        return
+
+    label_dirs = [d for d in labels_dir.iterdir() if d.is_dir()]
+    if not label_dirs:
+        print("Labels: no label caches found")
+        return
+
+    print(f"Labels ({len(label_dirs)} model {'identity' if len(label_dirs) == 1 else 'identities'}):")
+    for ldir in sorted(label_dirs):
+        cached_keys = list_cached_keys(ldir, ".json")
+        lbl_cached = sum(1 for _, h in file_hashes if h in cached_keys)
+        lbl_missing = total - lbl_cached
+        status = f"  [{ldir.name}]: {lbl_cached}/{total} cached"
+        if lbl_missing > 0:
+            status += f" ({lbl_missing} missing)"
+        print(status)
+
+
+def _flush_labels(repository: str):
+    """Delete cached labels only (keeps embeddings)."""
+    repo_dir = repo_cache_dir(repository)
+    labels_dir = repo_dir / "labels"
+    if labels_dir.exists():
+        size = sum(f.stat().st_size for f in labels_dir.rglob("*") if f.is_file())
+        shutil.rmtree(labels_dir)
+        print(f"Flushed label cache for {repository} ({size / 1e6:.1f} MB)")
+    else:
+        print(f"No label cache found for {repository}")
+
+
+def _parse_cli_tool(remaining: list[str], parser: argparse.ArgumentParser) -> list[str] | None:
+    """Parse CLI tool from remaining args. Returns command list or None."""
+    if not remaining or not remaining[0].startswith("--"):
+        return None
+    tool_name = remaining[0][2:]
+    if shutil.which(tool_name) is None:
+        parser.error(f"CLI tool '{tool_name}' not found on PATH")
+    return [tool_name] + remaining[1:]
+
+
+def _build_model_identity(arguments: argparse.Namespace, cli_command: list[str] | None) -> str:
+    """Build model identity string from arguments."""
+    identity_parts = []
+    if arguments.local:
+        identity_parts.append(f"local:{arguments.local}")
+        if arguments.local_file:
+            identity_parts.append(f"file:{arguments.local_file}")
+    if cli_command:
+        identity_parts.append(f"cli:{shlex.join(cli_command)}")
+    if arguments.openai:
+        identity_parts.append(f"openai:{arguments.completion_model}")
+    return "+".join(identity_parts)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog = "semantic-navigator",
@@ -1400,8 +244,9 @@ def main():
     parser.add_argument("--concurrency", type = int, default = None)
     parser.add_argument("--timeout", type = int, default = 60)
     parser.add_argument("--list-devices", action = "store_true")
-    parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached embeddings and labels for the given repository")
+    parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached labels for the given repository (preserves embeddings)")
     parser.add_argument("--flush-labels", action = "store_true", help = "Delete cached labels only (keeps embeddings)")
+    parser.add_argument("--status", action = "store_true", help = "Show cache status for the repository")
     parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
     parser.add_argument("--openai", action = "store_true", help = "Use OpenAI API for labeling (requires OPENAI_API_KEY)")
     parser.add_argument("--completion-model", default = "gpt-4o-mini", help = "OpenAI model for labeling (default: gpt-4o-mini)")
@@ -1417,63 +262,29 @@ def main():
         return
 
     if arguments.erase_models:
-        try:
-            from huggingface_hub import scan_cache_dir
-            cache_info = scan_cache_dir()
-            if not cache_info.repos:
-                print("No downloaded models found.")
-                return
-            total_size = sum(r.size_on_disk for r in cache_info.repos)
-            print(f"Downloaded models ({total_size / 1e9:.1f} GB):")
-            for repo in sorted(cache_info.repos, key=lambda r: r.size_on_disk, reverse=True):
-                print(f"  {repo.repo_id} ({repo.size_on_disk / 1e9:.1f} GB)")
-            confirm = input("\nDelete all downloaded models? [y/N] ").strip().lower()
-            if confirm == "y":
-                delete_strategy = cache_info.delete_revisions(
-                    [r.commit_hash for repo in cache_info.repos for r in repo.revisions]
-                )
-                delete_strategy.execute()
-                print("Done.")
-            else:
-                print("Aborted.")
-        except ImportError:
-            print("huggingface_hub is not installed.")
+        _handle_erase_models()
         return
 
     if arguments.repository is None:
         parser.error("the following arguments are required: repository")
 
     if arguments.flush_cache:
-        repo_dir = repo_cache_dir(arguments.repository)
-        emb_dir = app_cache_dir() / "embeddings"
-        flushed = False
-        if repo_dir.exists():
-            size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
-            shutil.rmtree(repo_dir)
-            print(f"Flushed repo cache for {arguments.repository} ({size / 1e6:.1f} MB)")
-            flushed = True
-        if emb_dir.exists():
-            size = sum(f.stat().st_size for f in emb_dir.rglob("*") if f.is_file())
-            shutil.rmtree(emb_dir)
-            print(f"Flushed shared embedding cache ({size / 1e6:.1f} MB)")
-            flushed = True
-        if not flushed:
-            print(f"No cache found.")
+        _flush_cache(arguments.repository)
         return
 
     if arguments.flush_labels:
-        repo_dir = repo_cache_dir(arguments.repository)
-        labels_dir = repo_dir / "labels"
-        if labels_dir.exists():
-            size = sum(f.stat().st_size for f in labels_dir.rglob("*") if f.is_file())
-            shutil.rmtree(labels_dir)
-            print(f"Flushed label cache for {arguments.repository} ({size / 1e6:.1f} MB)")
-        else:
-            print(f"No label cache found for {arguments.repository}")
+        _flush_labels(arguments.repository)
         return
 
-    # Extract CLI tool from unknown flags: --gemini → ["gemini"], --llm -m gpt-4o → ["llm", "-m", "gpt-4o"]
-    has_cli_tool = remaining and remaining[0].startswith("--")
+    if arguments.status:
+        embedding_model_name = arguments.embedding_model
+        if arguments.openai_embedding_model:
+            embedding_model_name = arguments.openai_embedding_model
+        _show_status(arguments.repository, embedding_model_name)
+        return
+
+    cli_command = _parse_cli_tool(remaining, parser)
+    has_cli_tool = cli_command is not None
 
     if arguments.local is None and not has_cli_tool and not arguments.openai:
         parser.error("no backend specified (e.g. --openai, --gemini, --llm, or --local)")
@@ -1496,13 +307,6 @@ def main():
     if arguments.concurrency is not None and arguments.local is not None and not has_cli_tool and not arguments.openai:
         parser.error("--concurrency has no effect with --local only (local model concurrency is 1 per device)")
 
-    cli_command = None
-    if has_cli_tool:
-        tool_name = remaining[0][2:]
-        if shutil.which(tool_name) is None:
-            parser.error(f"CLI tool '{tool_name}' not found on PATH")
-        cli_command = [tool_name] + remaining[1:]
-
     try:
         devices = [int(d.strip()) for d in arguments.device.split(",")]
     except ValueError:
@@ -1513,17 +317,7 @@ def main():
     if arguments.concurrency is None:
         arguments.concurrency = 4
 
-    identity_parts = []
-    if arguments.local:
-        identity_parts.append(f"local:{arguments.local}")
-        if arguments.local_file:
-            identity_parts.append(f"file:{arguments.local_file}")
-    if cli_command:
-        identity_parts.append(f"cli:{shlex.join(cli_command)}")
-    if arguments.openai:
-        identity_parts.append(f"openai:{arguments.completion_model}")
-    model_identity = "+".join(identity_parts)
-
+    model_identity = _build_model_identity(arguments, cli_command)
     openai_model = arguments.completion_model if arguments.openai else None
 
     # When using --openai with --openai-embedding-model, override the embedding model name for cache identity
