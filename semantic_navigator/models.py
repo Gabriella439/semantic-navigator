@@ -6,6 +6,8 @@ from pydantic import BaseModel
 
 @dataclass(frozen = True)
 class Facets:
+    repository: str
+    model_identity: str
     openai_client: object | None
     embedding_model: object | None
     embedding_model_name: str

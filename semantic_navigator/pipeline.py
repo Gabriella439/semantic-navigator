@@ -24,7 +24,12 @@ from tqdm.asyncio import tqdm_asyncio
 from typing import Iterable
 
 from semantic_navigator.models import (
-    Cluster, Embed, Facets, Labels, Tree,
+    Cluster, Embed, Facets, Label, Labels, Tree,
+)
+from semantic_navigator.cache import (
+    content_hash, embedding_cache_dir, label_cache_dir,
+    list_cached_keys, load_cached_embedding, load_cached_label,
+    save_cached_embedding, save_cached_label,
 )
 from semantic_navigator.util import to_files, to_pattern
 
@@ -34,6 +39,7 @@ max_leaves = 20
 
 
 def initialize(
+    repository: str,
     completion_model: str,
     embedding_model_name: str,
     local_embedding_model: str | None = None,
@@ -52,7 +58,11 @@ def initialize(
         embedding = None
         openai_embedding_model = embedding_model_name
 
+    model_identity = f"openai:{completion_model}"
+
     return Facets(
+        repository = repository,
+        model_identity = model_identity,
         openai_client = openai_client,
         embedding_model = embedding,
         embedding_model_name = embedding_model_name,
@@ -128,31 +138,32 @@ def _embed_with_fastembed(facets: Facets, contents: list[str]) -> list[NDArray[f
     ]
 
 
-async def embed(facets: Facets, directory: str) -> Cluster:
+def _generate_paths(directory: str) -> list[str]:
+    """Generate file paths from git index or directory scan."""
     try:
         repo = Repo.discover(directory)
-
-        def generate_paths() -> Iterable[str]:
-            for bytestring in repo.open_index().paths():
-                path = bytestring.decode("utf-8")
-
-                subdirectory = PurePath(directory).relative_to(repo.path)
-
-                try:
-                    relative_path = PurePath(path).relative_to(subdirectory)
-
-                    yield str(relative_path)
-                except ValueError:
-                    pass
-
+        paths = []
+        subdirectory = PurePath(directory).relative_to(repo.path)
+        for bytestring in repo.open_index().paths():
+            path = bytestring.decode("utf-8")
+            try:
+                relative_path = PurePath(path).relative_to(subdirectory)
+                paths.append(str(relative_path))
+            except ValueError:
+                pass
+        return paths
     except NotGitRepository:
-        def generate_paths() -> Iterable[str]:
-            for entry in os.scandir(directory):
-                if entry.is_file(follow_symlinks = False):
-                    yield entry.path
+        return [
+            entry.name for entry in os.scandir(directory)
+            if entry.is_file(follow_symlinks = False)
+        ]
+
+
+async def embed(facets: Facets, directory: str) -> Cluster:
+    file_paths = _generate_paths(directory)
 
     tasks = tqdm_asyncio.gather(
-        *(_read_file(directory, path) for path in generate_paths()),
+        *(_read_file(directory, path) for path in file_paths),
         desc = "Reading files",
         unit = "file",
         leave = False
@@ -165,10 +176,34 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     paths, contents = zip(*results)
 
-    if facets.openai_embedding_model is not None:
-        embeddings = await _embed_with_openai(facets, list(contents))
-    else:
-        embeddings = _embed_with_fastembed(facets, list(contents))
+    # Check embedding cache
+    cdir = embedding_cache_dir(facets.embedding_model_name)
+    cached_emb_keys = list_cached_keys(cdir, ".npy")
+    embeddings: list[NDArray[float32]] = [None] * len(contents)  # type: ignore[list-item]
+    uncached_indices = []
+
+    for i, content in enumerate(contents):
+        key = content_hash(content)
+        if key in cached_emb_keys:
+            embeddings[i] = load_cached_embedding(cdir, key)
+        else:
+            uncached_indices.append(i)
+
+    n_cached = len(contents) - len(uncached_indices)
+    if n_cached > 0:
+        print(f"Embeddings: {n_cached}/{len(contents)} cached, {len(uncached_indices)} to compute")
+
+    if uncached_indices:
+        uncached_contents = [contents[i] for i in uncached_indices]
+
+        if facets.openai_embedding_model is not None:
+            new_embeddings = await _embed_with_openai(facets, uncached_contents)
+        else:
+            new_embeddings = _embed_with_fastembed(facets, uncached_contents)
+
+        for i, embedding in zip(uncached_indices, new_embeddings):
+            embeddings[i] = embedding
+            save_cached_embedding(cdir, content_hash(contents[i]), embedding)
 
     embeds = [
         Embed(path, content, embedding)
@@ -351,28 +386,46 @@ def cluster(input: Cluster) -> list[Cluster]:
 
 async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
+    ldir = label_cache_dir(facets.repository, facets.model_identity)
 
     if len(children) == 1:
-        def render_embed(embed: Embed) -> str:
-            return f"# File: {embed.entry}\n\n{embed.content}"
+        # Check per-file label cache
+        cached_labels: dict[int, Label] = {}
+        uncached_embeds: list[tuple[int, Embed]] = []
+        for i, emb in enumerate(c.embeds):
+            cached = load_cached_label(ldir, content_hash(emb.content))
+            if cached is not None:
+                cached_labels[i] = cached
+            else:
+                uncached_embeds.append((i, emb))
 
-        rendered_embeds = "\n\n".join([ render_embed(embed) for embed in c.embeds ])
+        if uncached_embeds:
+            def render_embed(embed: Embed) -> str:
+                return f"# File: {embed.entry}\n\n{embed.content}"
 
-        input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
+            rendered_embeds = "\n\n".join([render_embed(emb) for _, emb in uncached_embeds])
 
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
-        )
+            input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
 
-        assert response.output_parsed is not None
+            response = await facets.openai_client.responses.parse(
+                model = facets.completion_model,
+                input = input,
+                text_format = Labels
+            )
 
-        # assert len(response.output_parsed.labels) == len(c.embeds)
+            assert response.output_parsed is not None
+
+            for (i, emb), label in zip(uncached_embeds, response.output_parsed.labels):
+                cached_labels[i] = label
+                save_cached_label(ldir, content_hash(emb.content), label)
 
         return [
-            Tree(f"{embed.entry}: {label.label}", [ embed.entry ], [])
-            for label, embed in zip(response.output_parsed.labels, c.embeds)
+            Tree(
+                f"{emb.entry}: {cached_labels[i].label}" if i in cached_labels else emb.entry,
+                [emb.entry],
+                [],
+            )
+            for i, emb in enumerate(c.embeds)
         ]
 
     else:
