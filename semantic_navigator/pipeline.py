@@ -402,6 +402,22 @@ def count_cached_labels(ct: ClusterTree, repository: str, model_identity: str, c
     return (total_uncached, total_cached, total_cached_clusters)
 
 
+def _count_expected_calls(ct: ClusterTree, cached_keys: set[str]) -> int:
+    """Estimate the number of LLM calls needed to label the tree.
+    Each cluster node = 1 call, each leaf with uncached files = 1+ calls."""
+    if not ct.children:
+        has_uncached = any(
+            content_hash(embed.content) not in cached_keys
+            for embed in ct.node.embeds
+        )
+        return 1 if has_uncached else 0
+
+    total = sum(_count_expected_calls(child, cached_keys) for child in ct.children)
+    # This cluster node itself will make 1 call (cached or not, it updates progress)
+    total += 1
+    return total
+
+
 async def _label_leaf_node(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
     """Handle leaf clusters: batch files, prompt for labels, cache results."""
     ldir = label_cache_dir(facets.repository, facets.model_identity)
@@ -551,8 +567,10 @@ async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float]
         print(f"Cache: {', '.join(cache_parts)}", flush=True)
     if uncached_files > 0:
         print(f"Labeling {uncached_files} uncached files...", flush=True)
+    cached_keys = list_cached_keys(label_cache_dir(facets.repository, facets.model_identity), ".json")
+    total_calls = _count_expected_calls(ct, cached_keys)
     with timed("Labeling", timings):
-        with tqdm(desc = "Labeling", unit = "call", leave = False) as progress:
+        with tqdm(total = total_calls, desc = "Labeling", unit = "call", leave = False) as progress:
             children = await label_nodes(facets, ct, progress)
 
     return Tree(label, to_files(children), children)

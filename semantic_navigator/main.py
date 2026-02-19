@@ -309,7 +309,11 @@ def main():
         print(f"Done! Total: {_fmt_time(total)} ({parts})")
         return tree_
 
-    tree_ = asyncio.run(async_tasks())
+    try:
+        tree_ = asyncio.run(async_tasks())
+    except KeyboardInterrupt:
+        print("\nInterrupted. Progress has been cached and will resume on next run.")
+        return
 
     UI(tree_).run()
 
