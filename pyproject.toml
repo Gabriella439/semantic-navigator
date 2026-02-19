@@ -16,6 +16,10 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+gpu = ["onnxruntime-directml"]
+local = ["llama-cpp-python"]
+
 [project.scripts]
 semantic-navigator = "semantic_navigator.main:main"
 

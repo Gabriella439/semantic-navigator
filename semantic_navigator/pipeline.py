@@ -2,6 +2,7 @@ import aiofiles
 import asyncio
 import collections
 import itertools
+import json
 import math
 import numpy
 import os
@@ -24,51 +25,41 @@ from tqdm.asyncio import tqdm_asyncio
 from typing import Iterable
 
 from semantic_navigator.models import (
-    Cluster, Embed, Facets, Label, Labels, Tree,
+    Cluster, ClusterTree, Embed, Facets, Labels, Tree,
 )
 from semantic_navigator.cache import (
-    content_hash, embedding_cache_dir, label_cache_dir,
-    list_cached_keys, load_cached_embedding, load_cached_label,
-    save_cached_embedding, save_cached_label,
+    cluster_hash, content_hash, embedding_cache_dir, label_cache_dir,
+    list_cached_keys, load_cached_cluster_labels, load_cached_embedding,
+    load_cached_label, save_cached_cluster_labels, save_cached_embedding,
+    save_cached_label,
 )
-from semantic_navigator.util import to_files, to_pattern
+from semantic_navigator.models import Label
+from semantic_navigator.util import timed, to_files, to_pattern
+from semantic_navigator.inference import complete
 
 max_clusters = 20
-
 max_leaves = 20
 
 
-def initialize(
-    repository: str,
-    completion_model: str,
-    embedding_model_name: str,
-    local_embedding_model: str | None = None,
-) -> Facets:
-    from openai import AsyncOpenAI
-
-    openai_client = AsyncOpenAI()
-
-    if local_embedding_model is not None:
-        # fastembed for local embeddings
-        from fastembed import TextEmbedding
-        embedding = TextEmbedding(model_name=local_embedding_model)
-        openai_embedding_model = None
-    else:
-        # OpenAI for embeddings (default)
-        embedding = None
-        openai_embedding_model = embedding_model_name
-
-    model_identity = f"openai:{completion_model}"
-
-    return Facets(
-        repository = repository,
-        model_identity = model_identity,
-        openai_client = openai_client,
-        embedding_model = embedding,
-        embedding_model_name = embedding_model_name,
-        completion_model = completion_model,
-        openai_embedding_model = openai_embedding_model,
-    )
+def _generate_paths(directory: str) -> list[str]:
+    """Generate file paths from git index or directory scan."""
+    try:
+        repo = Repo.discover(directory)
+        paths = []
+        subdirectory = PurePath(directory).relative_to(repo.path)
+        for bytestring in repo.open_index().paths():
+            path = bytestring.decode("utf-8")
+            try:
+                relative_path = PurePath(path).relative_to(subdirectory)
+                paths.append(str(relative_path))
+            except ValueError:
+                pass
+        return paths
+    except NotGitRepository:
+        return [
+            entry.name for entry in os.scandir(directory)
+            if entry.is_file(follow_symlinks = False)
+        ]
 
 
 async def _read_file(directory: str, path: str) -> tuple[str, str] | None:
@@ -82,7 +73,6 @@ async def _read_file(directory: str, path: str) -> tuple[str, str] | None:
     except UnicodeDecodeError:
         return None
     except IsADirectoryError:
-        # Submodules or symlinks to directories
         return None
 
 
@@ -125,38 +115,29 @@ async def _embed_with_openai(facets: Facets, contents: list[str]) -> list[NDArra
 
 
 def _embed_with_fastembed(facets: Facets, contents: list[str]) -> list[NDArray[float32]]:
-    """Embed contents using fastembed."""
-    return [
-        numpy.asarray(e, float32)
-        for e in tqdm(
-            facets.embedding_model.embed(contents),
-            desc = f"Embedding contents",
-            unit = "file",
-            total = len(contents),
-            leave = False
-        )
-    ]
+    """Embed contents using fastembed with GPU fallback."""
+    from fastembed import TextEmbedding
 
-
-def _generate_paths(directory: str) -> list[str]:
-    """Generate file paths from git index or directory scan."""
-    try:
-        repo = Repo.discover(directory)
-        paths = []
-        subdirectory = PurePath(directory).relative_to(repo.path)
-        for bytestring in repo.open_index().paths():
-            path = bytestring.decode("utf-8")
-            try:
-                relative_path = PurePath(path).relative_to(subdirectory)
-                paths.append(str(relative_path))
-            except ValueError:
-                pass
-        return paths
-    except NotGitRepository:
+    def do_embed(model, desc: str) -> list[NDArray[float32]]:
         return [
-            entry.name for entry in os.scandir(directory)
-            if entry.is_file(follow_symlinks = False)
+            numpy.asarray(e, float32)
+            for e in tqdm(
+                model.embed(contents, batch_size = facets.batch_size),
+                desc = desc,
+                unit = "file",
+                total = len(contents),
+                leave = False
+            )
         ]
+
+    try:
+        return do_embed(facets.embedding_model, f"Embedding contents")
+    except Exception as e:
+        if not facets.gpu:
+            raise
+        print(f"\nGPU embedding failed ({e}), falling back to CPU...")
+        cpu_model = TextEmbedding(model_name = facets.embedding_model_name, providers = ["CPUExecutionProvider"])
+        return do_embed(cpu_model, "Embedding contents (CPU)")
 
 
 async def embed(facets: Facets, directory: str) -> Cluster:
@@ -196,7 +177,7 @@ async def embed(facets: Facets, directory: str) -> Cluster:
     if uncached_indices:
         uncached_contents = [contents[i] for i in uncached_indices]
 
-        if facets.openai_embedding_model is not None:
+        if facets.openai_client is not None:
             new_embeddings = await _embed_with_openai(facets, uncached_contents)
         else:
             new_embeddings = _embed_with_fastembed(facets, uncached_contents)
@@ -224,25 +205,8 @@ def cluster(input: Cluster) -> list[Cluster]:
         for embed in input.embeds
     ))
 
-    # The following code computes an affinity matrix using a radial basis
-    # function with an adaptive σ.  See:
-    #
-    #     L. Zelnik-Manor, P. Perona (2004), "Self-Tuning Spectral Clustering"
-
     normalized = sklearn.preprocessing.normalize(embeddings)
 
-    # The original paper suggests setting K (`n_neighbors`) to 7.  Here we do
-    # something a little fancier and try to find a low value of `n_neighbors`
-    # that produces one connected component.  This usually ends up being around
-    # 7 anyway.
-    #
-    # The reason we want to avoid multiple connected components is because if
-    # we have more than one connected component then those connected components
-    # will dominate the clusters suggested by spectral clustering.  We don't
-    # want that because we don't want spectral clustering to degenerate to the
-    # same result as K nearest neighbors.  We want the K nearest neighbors
-    # algorithm to weakly inform the spectral clustering algorithm without
-    # dominating the result.
     def get_nearest_neighbors(n_neighbors: int) -> tuple[int, int, NearestNeighbors]:
         nearest_neighbors = NearestNeighbors(
             n_neighbors = n_neighbors,
@@ -261,8 +225,6 @@ def cluster(input: Cluster) -> list[Cluster]:
 
         return n_components, n_neighbors, nearest_neighbors
 
-    # We don't attempt to find the absolute lowest value of K (`n_neighbors`).
-    # Instead we just sample a few values and pick a "small enough" one.
     candidate_neighbor_counts = list(itertools.takewhile(
         lambda x: x < N,
         (round(math.exp(n)) for n in itertools.count())
@@ -273,20 +235,17 @@ def cluster(input: Cluster) -> list[Cluster]:
         for n_neighbors in candidate_neighbor_counts
     ]
 
-    # Find the first sample value of K (`n_neighbors`) that produces one
-    # connected component.  There's guaranteed to be at least one since the
-    # very last value we sample (⌊N/2⌋) always produces one connected
-    # component.
-    n_neighbors, nearest_neighbors = [
+    connected = [
         (n_neighbors, nearest_neighbors)
         for n_components, n_neighbors, nearest_neighbors in results
         if n_components == 1
-    ][0]
+    ]
+    if not connected:
+        return [input]
+    n_neighbors, nearest_neighbors = connected[0]
 
     distances, indices = nearest_neighbors.kneighbors()
 
-    # sigmas[i] = the distance of semantic embedding #i to its Kth nearest
-    # neighbor
     sigmas = distances[:, -1]
 
     rows    = numpy.repeat(numpy.arange(N), n_neighbors)
@@ -300,17 +259,12 @@ def cluster(input: Cluster) -> list[Cluster]:
     denominator = numpy.maximum(sigma_i * sigma_j, 1e-12)
     data = numpy.exp(-(d * d) / denominator).astype(numpy.float32)
 
-    # Affinity: A_ij = exp(-d(x_i, x_j)^2 / (σ_i σ_j))
     affinity = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
 
     affinity = (affinity + affinity.T) * 0.5
     affinity.setdiag(1.0)
     affinity.eliminate_zeros()
 
-    # The following code is basically `sklearn.manifold.spectral_embeddings`,
-    # but exploded out so that we can get access to the eigenvalues, which are
-    # normally not exposed by the function.  We'll need those eigenvalues
-    # later.
     random_state = sklearn.utils.check_random_state(0)
 
     laplacian, dd = scipy.sparse.csgraph.laplacian(
@@ -319,7 +273,6 @@ def cluster(input: Cluster) -> list[Cluster]:
         return_diag = True
     )
 
-    # laplacian = set_diag(laplacian, 1, True)
     laplacian = laplacian.tocoo()
     laplacian.data[laplacian.row == laplacian.col] = 1
     laplacian = laplacian.tocsr()
@@ -357,13 +310,6 @@ def cluster(input: Cluster) -> list[Cluster]:
     wide_spectral_embeddings = wide_spectral_embeddings[1:k].T
     eigenvalues = eigenvalues * -1
 
-    # Find the optimal cluster count by looking for the largest eigengap
-    #
-    # The reason the suggested cluster count is not just:
-    #
-    #     numpy.argmax(numpy.diff(eigenvalues)) + 1
-    #
-    # … is because we want at least two clusters
     n_clusters = numpy.argmax(numpy.diff(eigenvalues[1:])) + 2
 
     spectral_embeddings = wide_spectral_embeddings[:, :n_clusters]
@@ -384,89 +330,206 @@ def cluster(input: Cluster) -> list[Cluster]:
     return [ Cluster(embeds) for embeds in groups.values() ]
 
 
-async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
+def _count_tree_depth(ct: ClusterTree) -> int:
+    if not ct.children:
+        return 0
+    return 1 + max(_count_tree_depth(c) for c in ct.children)
+
+
+def _count_tree_leaves(ct: ClusterTree) -> int:
+    if not ct.children:
+        return 1
+    return sum(_count_tree_leaves(c) for c in ct.children)
+
+
+def build_cluster_tree(c: Cluster) -> ClusterTree:
     children = cluster(c)
-    ldir = label_cache_dir(facets.repository, facets.model_identity)
-
     if len(children) == 1:
-        # Check per-file label cache
-        cached_labels: dict[int, Label] = {}
-        uncached_embeds: list[tuple[int, Embed]] = []
-        for i, emb in enumerate(c.embeds):
-            cached = load_cached_label(ldir, content_hash(emb.content))
-            if cached is not None:
-                cached_labels[i] = cached
-            else:
-                uncached_embeds.append((i, emb))
+        return ClusterTree(c, [])
+    return ClusterTree(c, [build_cluster_tree(child) for child in children])
 
-        if uncached_embeds:
+
+def count_cached_labels(ct: ClusterTree, repository: str, model_identity: str, cached_keys: set[str] | None = None) -> tuple[int, int, int]:
+    if cached_keys is None:
+        cached_keys = list_cached_keys(label_cache_dir(repository, model_identity), ".json")
+    if not ct.children:
+        uncached = sum(
+            1 for embed in ct.node.embeds
+            if content_hash(embed.content) not in cached_keys
+        )
+        cached = len(ct.node.embeds) - uncached
+        return (uncached, cached, 0)
+
+    total_uncached = 0
+    total_cached = 0
+    total_cached_clusters = 0
+    for child in ct.children:
+        uncached, cached, cc = count_cached_labels(child, repository, model_identity, cached_keys)
+        total_uncached += uncached
+        total_cached += cached
+        total_cached_clusters += cc
+    all_files = [e.entry for e in ct.node.embeds]
+    c_key = "cluster-" + cluster_hash(all_files)
+    if c_key in cached_keys:
+        total_cached_clusters += 1
+    return (total_uncached, total_cached, total_cached_clusters)
+
+
+def _count_expected_calls(ct: ClusterTree, cached_keys: set[str]) -> int:
+    if not ct.children:
+        has_uncached = any(
+            content_hash(embed.content) not in cached_keys
+            for embed in ct.node.embeds
+        )
+        return 1 if has_uncached else 0
+
+    total = sum(_count_expected_calls(child, cached_keys) for child in ct.children)
+    total += 1
+    return total
+
+
+async def _label_leaf_node(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
+    ldir = label_cache_dir(facets.repository, facets.model_identity)
+    cached_labels: dict[int, Label] = {}
+    uncached_embeds: list[tuple[int, Embed]] = []
+
+    for i, embed in enumerate(ct.node.embeds):
+        cached = load_cached_label(ldir, content_hash(embed.content))
+        if cached is not None:
+            cached_labels[i] = cached
+        else:
+            uncached_embeds.append((i, embed))
+
+    if uncached_embeds:
+        if facets.pool.min_local_n_ctx is not None:
+            max_chars = max(int((facets.pool.min_local_n_ctx - 4096) * 1.5) - 1000, 1000)
+
+            def render_embed(embed: Embed) -> str:
+                content = embed.content
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "\n... (truncated)"
+                return f"# File: {embed.entry}\n\n{content}"
+
+            batches: list[list[tuple[int, Embed]]] = []
+            batch: list[tuple[int, Embed]] = []
+            batch_size = 0
+            for item in uncached_embeds:
+                size = min(len(item[1].content), max_chars) + len(item[1].entry) + 20
+                if batch and batch_size + size > max_chars:
+                    batches.append(batch)
+                    batch = [item]
+                    batch_size = size
+                else:
+                    batch.append(item)
+                    batch_size += size
+            if batch:
+                batches.append(batch)
+        else:
             def render_embed(embed: Embed) -> str:
                 return f"# File: {embed.entry}\n\n{embed.content}"
 
-            rendered_embeds = "\n\n".join([render_embed(emb) for _, emb in uncached_embeds])
+            batches = [uncached_embeds]
 
-            input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
+        schema = json.dumps(Labels.model_json_schema(), indent=2)
 
-            response = await facets.openai_client.responses.parse(
-                model = facets.completion_model,
-                input = input,
-                text_format = Labels
+        async def process_batch(batch: list[tuple[int, Embed]]) -> None:
+            rendered_embeds = "\n\n".join([ render_embed(embed) for _, embed in batch ])
+
+            prompt = (
+                f"Label each file in 3 to 7 words. Don't include file path/names in descriptions.\n"
+                f"Return exactly {len(batch)} label{'s' if len(batch) != 1 else ''}, one per file.\n\n"
+                f"{rendered_embeds}\n\n"
+                f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
             )
 
-            assert response.output_parsed is not None
+            result = await complete(facets, prompt, Labels, progress, expected_count=len(batch))
 
-            for (i, emb), label in zip(uncached_embeds, response.output_parsed.labels):
+            for (i, embed), label in zip(batch, result.labels):
                 cached_labels[i] = label
-                save_cached_label(ldir, content_hash(emb.content), label)
+                save_cached_label(ldir, content_hash(embed.content), label)
 
-        return [
-            Tree(
-                f"{emb.entry}: {cached_labels[i].label}" if i in cached_labels else emb.entry,
-                [emb.entry],
-                [],
-            )
-            for i, emb in enumerate(c.embeds)
-        ]
+        await asyncio.gather(*(process_batch(batch) for batch in batches))
 
-    else:
-        if depth == 0:
-            treess = await tqdm_asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
-                desc = "Labeling clusters",
-                unit = "cluster",
-                leave = False
-            )
-        else:
-            treess = await asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
-            )
-
-        def render_cluster(trees: list[Tree]) -> str:
-            rendered_trees = "\n".join([ tree.label for tree in trees ])
-
-            return f"# Cluster\n\n{rendered_trees}"
-
-        rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
-
-        input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
-
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
+    return [
+        Tree(
+            f"{embed.entry}: {cached_labels[i].label}" if i in cached_labels else embed.entry,
+            [ embed.entry ],
+            [],
         )
+        for i, embed in enumerate(ct.node.embeds)
+    ]
 
-        assert response.output_parsed is not None
 
-        # assert len(response.output_parsed.labels) == len(children)
+async def _label_cluster_node(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
+    treess = await asyncio.gather(
+        *(label_nodes(facets, child, progress) for child in ct.children),
+    )
 
+    ldir = label_cache_dir(facets.repository, facets.model_identity)
+    all_files = [f for trees in treess for tree in trees for f in tree.files]
+    c_key = cluster_hash(all_files)
+    cached_cluster = load_cached_cluster_labels(ldir, c_key)
+
+    if cached_cluster is not None and len(cached_cluster.labels) == len(treess):
+        tqdm.write(f"  Cluster ({len(treess)} children): cached")
+        if progress is not None:
+            progress.update(1)
         return [
             Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
-            for label, trees in zip(response.output_parsed.labels, treess)
+            for label, trees in zip(cached_cluster.labels, treess)
         ]
 
+    def render_cluster(trees: list[Tree]) -> str:
+        rendered_trees = "\n".join([ tree.label for tree in trees ])
+        return f"# Cluster\n\n{rendered_trees}"
 
-async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    children = await label_nodes(facets, c, 0)
+    rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
+
+    schema = json.dumps(Labels.model_json_schema(), indent=2)
+    prompt = (
+        f"Label each cluster in 2 words. Don't include file path/names in labels.\n"
+        f"Return exactly {len(treess)} label{'s' if len(treess) != 1 else ''}, one per cluster.\n\n"
+        f"{rendered_clusters}\n\n"
+        f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
+    )
+
+    labels = await complete(facets, prompt, Labels, progress, expected_count=len(treess))
+
+    save_cached_cluster_labels(ldir, c_key, labels)
+
+    return [
+        Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
+        for label, trees in zip(labels.labels, treess)
+    ]
+
+
+async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
+    if not ct.children:
+        return await _label_leaf_node(facets, ct, progress)
+    return await _label_cluster_node(facets, ct, progress)
+
+
+async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float] | None = None) -> Tree:
+    with timed("Clustering", timings):
+        ct = build_cluster_tree(c)
+    depth = _count_tree_depth(ct)
+    leaves = _count_tree_leaves(ct)
+    print(f"  {leaves} leaf clusters, depth {depth}")
+    uncached_files, cached_files, cached_clusters = count_cached_labels(ct, facets.repository, facets.model_identity)
+    total_files = cached_files + uncached_files
+    cache_parts = []
+    if cached_files > 0:
+        cache_parts.append(f"{cached_files}/{total_files} file labels")
+    if cached_clusters > 0:
+        cache_parts.append(f"{cached_clusters} cluster labels")
+    if cache_parts:
+        print(f"Cache: {', '.join(cache_parts)}", flush=True)
+    if uncached_files > 0:
+        print(f"Labeling {uncached_files} uncached files...", flush=True)
+    cached_keys = list_cached_keys(label_cache_dir(facets.repository, facets.model_identity), ".json")
+    total_calls = _count_expected_calls(ct, cached_keys)
+    with timed("Labeling", timings):
+        with tqdm(total = total_calls, desc = "Labeling", unit = "call", leave = False) as progress:
+            children = await label_nodes(facets, ct, progress)
 
     return Tree(label, to_files(children), children)
