@@ -104,8 +104,8 @@ def case_insensitive_glob(pattern: str) -> str:
     )
 
 gguf_quant_preference = [
-    "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q3_k_m", "q3_k_l",
-    "q6_k", "q8_0", "q2_k", "q4_0", "q5_0", "q3_k_s",
+    "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s", "q6_k", "q3_k_l",
+    "q3_k_m", "q8_0", "q4_0", "q5_0", "q3_k_s", "q2_k",
     "fp16", "f16",
 ]
 
@@ -918,7 +918,8 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
                 rendered_embeds = "\n\n".join([ render_embed(embed) for _, embed in batch ])
 
                 prompt = (
-                    f"Label each file in 3 to 7 words. Don't include file path/names in descriptions.\n\n"
+                    f"Label each file in 3 to 7 words. Don't include file path/names in descriptions.\n"
+                    f"Return exactly {len(batch)} label{'s' if len(batch) != 1 else ''}, one per file.\n\n"
                     f"{rendered_embeds}\n\n"
                     f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
                 )
@@ -952,7 +953,8 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
         schema = json.dumps(Labels.model_json_schema(), indent=2)
         prompt = (
-            f"Label each cluster in 2 words. Don't include file path/names in labels.\n\n"
+            f"Label each cluster in 2 words. Don't include file path/names in labels.\n"
+            f"Return exactly {len(treess)} label{'s' if len(treess) != 1 else ''}, one per cluster.\n\n"
             f"{rendered_clusters}\n\n"
             f"Respond with ONLY valid JSON matching this schema (no markdown, no code fences, no other text):\n{schema}"
         )
