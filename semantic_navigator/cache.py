@@ -21,13 +21,8 @@ def app_cache_dir() -> Path:
     return base / "semantic-navigator"
 
 
-def _sanitize_path(path: str) -> str:
-    """Turn an absolute path into a safe directory name."""
-    resolved = os.path.realpath(path)
-    return resolved.replace("\\", "--").replace("/", "--").replace(":", "")
-
-
 def repo_cache_dir(repository: str) -> Path:
+    from semantic_navigator.util import _sanitize_path
     return app_cache_dir() / "repos" / _sanitize_path(repository)
 
 

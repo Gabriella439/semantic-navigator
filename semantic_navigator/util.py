@@ -44,6 +44,12 @@ def repair_json(text: str) -> str:
     return text
 
 
+def _sanitize_path(path: str) -> str:
+    """Turn an absolute path into a safe directory name."""
+    resolved = os.path.realpath(path)
+    return resolved.replace("\\", "--").replace("/", "--").replace(":", "")
+
+
 def case_insensitive_glob(pattern: str) -> str:
     return ''.join(
         f'[{c.upper()}{c.lower()}]' if c.isalpha() else c

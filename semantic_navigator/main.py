@@ -18,27 +18,57 @@ from semantic_navigator.util import _fmt_time, timed
 
 
 class UI(textual.app.App):
+    BINDINGS = [("slash", "focus_search", "Search"), ("escape", "clear_search", "Clear")]
+
     def __init__(self, tree_):
         super().__init__()
         self.tree_ = tree_
 
     async def on_mount(self):
+        self.search_input = textual.widgets.Input(placeholder="Search (press / to focus)...")
+        self.search_input.display = False
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+        self._build_tree()
+        await self.mount(self.search_input)
+        await self.mount(self.treeview)
+
+    def _build_tree(self, filter_text: str = ""):
+        self.treeview.clear()
+        self.treeview.root.set_label(f"{self.tree_.label} ({len(self.tree_.files)})")
+
+        def matches(child: Tree, text: str) -> bool:
+            if text in child.label.lower():
+                return True
+            return any(text in f.lower() for f in child.files)
 
         def loop(node, children):
             for child in children:
+                if filter_text and not matches(child, filter_text):
+                    continue
                 if len(child.files) <= 1:
                     n = node.add(child.label)
                     n.allow_expand = False
                 else:
                     n = node.add(f"{child.label} ({len(child.files)})")
                     n.allow_expand = True
-
                     loop(n, child.children)
 
         loop(self.treeview.root, self.tree_.children)
+        if filter_text:
+            self.treeview.root.expand_all()
 
-        self.mount(self.treeview)
+    def action_focus_search(self):
+        self.search_input.display = True
+        self.search_input.focus()
+
+    def action_clear_search(self):
+        self.search_input.value = ""
+        self.search_input.display = False
+        self._build_tree()
+        self.treeview.focus()
+
+    def on_input_changed(self, event: textual.widgets.Input.Changed):
+        self._build_tree(event.value.strip().lower())
 
 
 def _handle_erase_models():
