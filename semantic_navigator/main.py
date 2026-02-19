@@ -207,7 +207,7 @@ def select_best_gguf(repo_id: str, memory_budget: int | None, kv_cache_reserve: 
 
     if memory_budget is not None:
         # Reserve space for KV cache, GPU API overhead, and embedding model
-        budget = int(memory_budget * 0.7) - kv_cache_reserve
+        budget = int(memory_budget * 0.6) - kv_cache_reserve
         fitting = [c for c in candidates if c[1] <= budget]
         if fitting:
             # Largest model that fits = best quality; prefer single files as tiebreaker
