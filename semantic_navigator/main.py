@@ -1054,7 +1054,7 @@ def main():
             confirm = input("\nDelete all downloaded models? [y/N] ").strip().lower()
             if confirm == "y":
                 delete_strategy = cache_info.delete_revisions(
-                    r.commit_hash for repo in cache_info.repos for r in repo.revisions
+                    [r.commit_hash for repo in cache_info.repos for r in repo.revisions]
                 )
                 delete_strategy.execute()
                 print("Done.")
