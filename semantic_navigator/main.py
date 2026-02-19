@@ -532,40 +532,45 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                         "type": "json_object",
                         "schema": _build_labels_schema(expected_count),
                     }
-                loop = asyncio.get_event_loop()
-                raw = await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt, response_format)
+                loop = asyncio.get_running_loop()
+                try:
+                    raw = await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt, response_format)
+                except (OSError, RuntimeError) as e:
+                    # Local model crash — permanently remove this aspect
+                    release_aspect = False
+                    remaining = [a for a in facets.pool.aspects if a is not aspect]
+                    if not remaining:
+                        raise SystemExit(f"All inference backends have failed. Last error: {e}")
+                    facets.pool.aspects = remaining
+                    tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({len(remaining)} remaining)")
+                    if attempt < max_retries - 1:
+                        continue
+                    raise
             else:
                 if facets.debug:
                     cmd = shlex.join(aspect.cli_command)
                     print(f"[debug] command: {cmd}")
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, lambda: subprocess.run(
+                loop = asyncio.get_running_loop()
+                cli_result = await loop.run_in_executor(None, lambda: subprocess.run(
                     aspect.cli_command,
                     input=prompt.encode(),
                     capture_output=True,
                     timeout=facets.timeout,
                 ))
-                raw = result.stdout.decode()
+                raw = cli_result.stdout.decode()
                 if facets.debug:
-                    print(f"[debug] exit code: {result.returncode}")
+                    print(f"[debug] exit code: {cli_result.returncode}")
                     print(f"[debug] stdout ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
-                    if result.stderr:
-                        print(f"[debug] stderr: {result.stderr.decode()[:500]}")
-                if result.returncode != 0:
+                    if cli_result.stderr:
+                        print(f"[debug] stderr: {cli_result.stderr.decode()[:500]}")
+                if cli_result.returncode != 0:
+                    # CLI non-zero exit is transient — retry with same aspect
+                    tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: CLI exit {cli_result.returncode}")
+                    if attempt < max_retries - 1:
+                        continue
                     raise RuntimeError(
-                        f"CLI command failed (exit {result.returncode}): {result.stderr.decode()}"
+                        f"CLI command failed (exit {cli_result.returncode}): {cli_result.stderr.decode()}"
                     )
-        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
-            # Model crash or CLI failure — don't return this aspect to the pool
-            release_aspect = False
-            remaining = [a for a in facets.pool.aspects if a is not aspect]
-            if not remaining:
-                raise SystemExit(f"All inference backends have failed. Last error: {e}")
-            facets.pool.aspects = remaining
-            tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({len(remaining)} remaining)")
-            if attempt < max_retries - 1:
-                continue
-            raise
         finally:
             if release_aspect:
                 facets.pool.release(aspect)
@@ -575,37 +580,37 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
         if facets.debug:
             print(f"[debug] extracted JSON: {extracted[:500]}{'...' if len(extracted) > 500 else ''}")
         try:
-            result = output_type.model_validate_json(extracted)
+            parsed = output_type.model_validate_json(extracted)
         except Exception:
             repaired = repair_json(extracted)
             if facets.debug:
                 print(f"[debug] repaired JSON: {repaired[:500]}{'...' if len(repaired) > 500 else ''}")
             try:
-                result = output_type.model_validate_json(repaired)
+                parsed = output_type.model_validate_json(repaired)
             except Exception as e:
                 if attempt < max_retries - 1:
                     tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: parse error: {e}")
                     continue
                 raise
-        if expected_count is not None and hasattr(result, 'labels') and len(result.labels) != expected_count:
-            if len(result.labels) > expected_count:
-                tqdm.write(f"[{aspect.name}] Truncating {len(result.labels)} → {expected_count} labels")
-                result.labels = result.labels[:expected_count]
+        if expected_count is not None and hasattr(parsed, 'labels') and len(parsed.labels) != expected_count:
+            if len(parsed.labels) > expected_count:
+                tqdm.write(f"[{aspect.name}] Truncating {len(parsed.labels)} → {expected_count} labels")
+                parsed.labels = parsed.labels[:expected_count]
             elif attempt < max_count_retries - 1:
-                tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(result.labels)}")
+                tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(parsed.labels)}")
                 continue
             else:
                 # Pad with generic labels rather than retrying forever
-                tqdm.write(f"Padding {len(result.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
-                while len(result.labels) < expected_count:
-                    result.labels.append(Label(
+                tqdm.write(f"Padding {len(parsed.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
+                while len(parsed.labels) < expected_count:
+                    parsed.labels.append(Label(
                         overarchingTheme = "Miscellaneous",
                         distinguishingFeature = "Ungrouped",
                         label = "Miscellaneous",
                     ))
         if progress is not None:
             progress.update(1)
-        return result
+        return parsed
 
 class Label(BaseModel):
     overarchingTheme: str
@@ -1336,7 +1341,7 @@ def main():
         if repo_dir.exists():
             size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
             shutil.rmtree(repo_dir)
-            print(f"Flushed label cache for {arguments.repository} ({size / 1e6:.1f} MB)")
+            print(f"Flushed repo cache for {arguments.repository} ({size / 1e6:.1f} MB)")
             flushed = True
         if emb_dir.exists():
             size = sum(f.stat().st_size for f in emb_dir.rglob("*") if f.is_file())
