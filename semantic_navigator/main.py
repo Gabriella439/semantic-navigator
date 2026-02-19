@@ -144,8 +144,9 @@ def detect_device_memory(gpu: bool, device: int) -> int | None:
         pass
     return None
 
-def select_best_gguf(repo_id: str, memory_budget: int | None) -> tuple[list[str], int]:
-    """Auto-select the best GGUF for the device. Returns (filenames, total_bytes)."""
+def select_best_gguf(repo_id: str, memory_budget: int | None, kv_cache_reserve: int = 0) -> tuple[list[str], int]:
+    """Auto-select the best GGUF for the device. Returns (filenames, total_bytes).
+    kv_cache_reserve: bytes to reserve for KV cache and other runtime overhead."""
     from huggingface_hub import HfApi
 
     info = HfApi().model_info(repo_id, files_metadata=True)
@@ -170,7 +171,8 @@ def select_best_gguf(repo_id: str, memory_budget: int | None) -> tuple[list[str]
     ]
 
     if memory_budget is not None:
-        budget = int(memory_budget * 0.8)
+        # Reserve space for KV cache, GPU API overhead, and embedding model
+        budget = int(memory_budget * 0.7) - kv_cache_reserve
         fitting = [c for c in candidates if c[1] <= budget]
         if fitting:
             # Largest model that fits = best quality; prefer single files as tiebreaker
@@ -241,7 +243,10 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
     else:
         if local_file is None:
             memory_budget = detect_device_memory(gpu, device)
-            local_files, model_size = select_best_gguf(local, memory_budget)
+            # Reserve ~2 bytes per token per layer for KV cache, plus 1GB for runtime overhead.
+            # Conservative estimate: 128 layers (covers up to ~70B models).
+            kv_cache_reserve = n_ctx * 128 * 2 + int(1e9)
+            local_files, model_size = select_best_gguf(local, memory_budget, kv_cache_reserve)
             n_gpu_layers = _resolve_gpu_layers(gpu, gpu_layers, device, model_size)
             print(f"Local model: {local} (auto-selected: {local_files[0]}, {model_size / 1e9:.1f} GB, {'GPU ' + str(device) if gpu else 'CPU'})")
         else:
