@@ -7,13 +7,17 @@ requires-python = ">=3.12"
 dependencies = [
     "aiofiles",
     "dulwich",
-    "openai[aiohttp]",
+    "fastembed",
     "pydantic",
     "scikit-learn",
     "textual",
-    "tiktoken",
     "tqdm",
 ]
+
+[project.optional-dependencies]
+gpu = ["onnxruntime-directml"]
+local = ["llama-cpp-python"]
+openai = ["openai", "tiktoken"]
 
 [project.scripts]
 semantic-navigator = "semantic_navigator.main:main"
@@ -21,6 +25,9 @@ semantic-navigator = "semantic_navigator.main:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["semantic_navigator"]

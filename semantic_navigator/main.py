@@ -1,514 +1,312 @@
-import aiofiles
 import argparse
 import asyncio
-import collections
-import itertools
-import math
-import numpy
-import os
-import scipy
-import sklearn
+import shlex
+import shutil
+import time
+
 import textual
 import textual.app
 import textual.widgets
-import tiktoken
 
-from dataclasses import dataclass
-from dulwich.errors import NotGitRepository
-from dulwich.repo import Repo
-from itertools import batched, chain
-from numpy import float32
-from numpy.typing import NDArray
-from pathlib import PurePath
-from pydantic import BaseModel
-from openai import AsyncOpenAI
-from sklearn.neighbors import NearestNeighbors
-from tiktoken import Encoding
-from typing import Iterable
-from tqdm.asyncio import tqdm_asyncio
+from semantic_navigator.cache import content_hash, list_cached_keys, repo_cache_dir
+from semantic_navigator.gpu import list_devices
+from semantic_navigator.inference import initialize
+from semantic_navigator.models import Facets, Tree
+from semantic_navigator.pipeline import _generate_paths, embed, tree
+from semantic_navigator.util import _fmt_time, timed
 
-max_clusters = 20
-
-@dataclass(frozen = True)
-class Facets:
-    openai_client: AsyncOpenAI
-    embedding_model: str
-    completion_model: str
-    embedding_encoding: Encoding
-    completion_encoding: Encoding
-
-def initialize(completion_model: str, embedding_model: str) -> Facets:
-    openai_client = AsyncOpenAI()
-
-    embedding_model = embedding_model
-
-    completion_model = completion_model
-
-    embedding_encoding = tiktoken.encoding_for_model(embedding_model)
-
-    try:
-        completion_encoding = tiktoken.encoding_for_model(completion_model)
-    except KeyError:
-        completion_encoding = tiktoken.get_encoding("o200k_base")
-
-    return Facets(
-        openai_client = openai_client,
-        embedding_model = embedding_model,
-        completion_model = completion_model,
-        embedding_encoding = embedding_encoding,
-        completion_encoding = completion_encoding
-    )
-
-@dataclass(frozen = True)
-class Embed:
-    entry: str
-    content: str
-    embedding: NDArray[float32]
-
-@dataclass(frozen = True)
-class Cluster:
-    embeds: list[Embed]
-
-max_tokens_per_embed = 8192
-
-max_tokens_per_batch_embed = 300000
-
-async def embed(facets: Facets, directory: str) -> Cluster:
-    try:
-        repo = Repo.discover(directory)
-
-        def generate_paths() -> Iterable[str]:
-            for bytestring in repo.open_index().paths():
-                path = bytestring.decode("utf-8")
-
-                subdirectory = PurePath(directory).relative_to(repo.path)
-
-                try:
-                    relative_path = PurePath(path).relative_to(subdirectory)
-
-                    yield str(relative_path)
-                except ValueError:
-                    pass
-
-    except NotGitRepository:
-        def generate_paths() -> Iterable[str]:
-            for entry in os.scandir(directory):
-                if entry.is_file(follow_symlinks = False):
-                    yield entry.path
-
-    async def read(path) -> list[tuple[str, str]]:
-        try:
-            absolute_path = os.path.join(directory, path)
-
-            async with aiofiles.open(absolute_path, "rb") as handle:
-                prefix = f"{path}:\n\n"
-
-                bytestring = await handle.read()
-
-                text = bytestring.decode("utf-8")
-
-                prefix_tokens = facets.embedding_encoding.encode(prefix)
-                text_tokens   = facets.embedding_encoding.encode(text)
-
-                max_tokens_per_chunk = max_tokens_per_embed - len(prefix_tokens)
-
-                return [
-                    (path, facets.embedding_encoding.decode(prefix_tokens + list(chunk)))
-
-                    # TODO: This currently only takes the first chunk because
-                    # GPT has trouble labeling chunks in order when multiple
-                    # chunks have the same file name.  Remove the `[:1]` when
-                    # this is fixed.
-                    for chunk in list(batched(text_tokens, max_tokens_per_chunk))[:1]
-                ]
-
-        except UnicodeDecodeError:
-            # Ignore files that aren't UTF-8
-            return [ ]
-
-        except IsADirectoryError:
-            # This can happen when a "file" listed by the repository is:
-            #
-            # - a submodule
-            # - a symlink to a directory
-            #
-            # TODO: The submodule case can and should be fixed and properly
-            # handled
-            return [ ]
-
-    tasks = tqdm_asyncio.gather(
-        *(read(path) for path in generate_paths()),
-        desc = "Reading files",
-        unit = "file",
-        leave = False
-    )
-
-    results = list(chain.from_iterable(await tasks))
-
-    if not results:
-        return Cluster([])
-
-    paths, contents = zip(*results)
-
-    max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
-
-    async def embed_batch(input) -> list[NDArray[float32]]:
-        response = await facets.openai_client.embeddings.create(
-            model = facets.embedding_model,
-            input = input
-        )
-
-        return [
-            numpy.asarray(datum.embedding, float32) for datum in response.data
-        ]
-
-    tasks = tqdm_asyncio.gather(
-        *(embed_batch(input) for input in batched(contents, max_embeds)),
-        desc = "Embedding contents",
-        unit = "batch",
-        leave = False
-    )
-
-    embeddings = list(chain.from_iterable(await tasks))
-
-    embeds = [
-        Embed(path, content, embedding)
-        for path, content, embedding in zip(paths, contents, embeddings)
-    ]
-
-    return Cluster(embeds)
-
-# The clustering algorithm can go as low as 1 here, but we set it higher for
-# two reasons:
-#
-# - it's easier for users to navigate when there is more branching at the
-#   leaves
-# - this also avoids straining the tree visualizer, which doesn't like a really
-#   deeply nested tree structure.
-max_leaves = 20
-
-def cluster(input: Cluster) -> list[Cluster]:
-    N = len(input.embeds)
-
-    if N <= max_leaves:
-        return [input]
-
-    entries, contents, embeddings = zip(*(
-        (embed.entry, embed.content, embed.embedding)
-        for embed in input.embeds
-    ))
-
-    # The following code computes an affinity matrix using a radial basis
-    # function with an adaptive σ.  See:
-    #
-    #     L. Zelnik-Manor, P. Perona (2004), "Self-Tuning Spectral Clustering"
-
-    normalized = sklearn.preprocessing.normalize(embeddings)
-
-    # The original paper suggests setting K (`n_neighbors`) to 7.  Here we do
-    # something a little fancier and try to find a low value of `n_neighbors`
-    # that produces one connected component.  This usually ends up being around
-    # 7 anyway.
-    #
-    # The reason we want to avoid multiple connected components is because if
-    # we have more than one connected component then those connected components
-    # will dominate the clusters suggested by spectral clustering.  We don't
-    # want that because we don't want spectral clustering to degenerate to the
-    # same result as K nearest neighbors.  We want the K nearest neighbors
-    # algorithm to weakly inform the spectral clustering algorithm without
-    # dominating the result.
-    def get_nearest_neighbors(n_neighbors: int) -> tuple[int, int, NearestNeighbors]:
-        nearest_neighbors = NearestNeighbors(
-            n_neighbors = n_neighbors,
-            metric = "cosine",
-            n_jobs = -1
-        ).fit(normalized)
-
-        graph = nearest_neighbors.kneighbors_graph(
-            mode = "connectivity"
-        )
-
-        n_components, _ = scipy.sparse.csgraph.connected_components(
-            graph,
-            directed = False
-        )
-
-        return n_components, n_neighbors, nearest_neighbors
-
-    # We don't attempt to find the absolute lowest value of K (`n_neighbors`).
-    # Instead we just sample a few values and pick a "small enough" one.
-    candidate_neighbor_counts = list(itertools.takewhile(
-        lambda x: x < N,
-        (round(math.exp(n)) for n in itertools.count())
-    )) + [ math.floor(N / 2) ]
-
-    results = [
-        get_nearest_neighbors(n_neighbors)
-        for n_neighbors in candidate_neighbor_counts
-    ]
-
-    # Find the first sample value of K (`n_neighbors`) that produces one
-    # connected component.  There's guaranteed to be at least one since the
-    # very last value we sample (⌊N/2⌋) always produces one connected
-    # component.
-    n_neighbors, nearest_neighbors = [
-        (n_neighbors, nearest_neighbors)
-        for n_components, n_neighbors, nearest_neighbors in results
-        if n_components == 1
-    ][0]
-
-    distances, indices = nearest_neighbors.kneighbors()
-
-    # sigmas[i] = the distance of semantic embedding #i to its Kth nearest
-    # neighbor
-    sigmas = distances[:, -1]
-
-    rows    = numpy.repeat(numpy.arange(N), n_neighbors)
-    columns = indices.reshape(-1)
-
-    d = distances.reshape(-1)
-
-    sigma_i = numpy.repeat(sigmas, n_neighbors)
-    sigma_j = sigmas[columns]
-
-    denominator = numpy.maximum(sigma_i * sigma_j, 1e-12)
-    data = numpy.exp(-(d * d) / denominator).astype(numpy.float32)
-
-    # Affinity: A_ij = exp(-d(x_i, x_j)^2 / (σ_i σ_j))
-    affinity = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
-
-    affinity = (affinity + affinity.T) * 0.5
-    affinity.setdiag(1.0)
-    affinity.eliminate_zeros()
-
-    # The following code is basically `sklearn.manifold.spectral_embeddings`,
-    # but exploded out so that we can get access to the eigenvalues, which are
-    # normally not exposed by the function.  We'll need those eigenvalues
-    # later.
-    random_state = sklearn.utils.check_random_state(0)
-
-    laplacian, dd = scipy.sparse.csgraph.laplacian(
-        affinity,
-        normed = True,
-        return_diag = True
-    )
-
-    # laplacian = set_diag(laplacian, 1, True)
-    laplacian = laplacian.tocoo()
-    laplacian.data[laplacian.row == laplacian.col] = 1
-    laplacian = laplacian.tocsr()
-
-    laplacian *= -1
-    v0 = random_state.uniform(-1, 1, N)
-
-    if max_clusters + 1 < N:
-        k = max_clusters + 1
-
-        eigenvalues, eigenvectors = scipy.sparse.linalg.eigsh(
-            laplacian,
-            k = k,
-            sigma = 1.0,
-            which = 'LM',
-            tol = 0.0,
-            v0 = v0
-        )
-    else:
-        k = N
-
-        eigenvalues, eigenvectors = scipy.linalg.eigh(
-            laplacian.toarray(),
-            check_finite = False
-        )
-
-    indices = numpy.argsort(eigenvalues)[::-1]
-
-    eigenvalues = eigenvalues[indices]
-
-    eigenvectors = eigenvectors[:, indices]
-
-    wide_spectral_embeddings = eigenvectors.T / dd
-    wide_spectral_embeddings = sklearn.utils.extmath._deterministic_vector_sign_flip(wide_spectral_embeddings)
-    wide_spectral_embeddings = wide_spectral_embeddings[1:k].T
-    eigenvalues = eigenvalues * -1
-
-    # Find the optimal cluster count by looking for the largest eigengap
-    #
-    # The reason the suggested cluster count is not just:
-    #
-    #     numpy.argmax(numpy.diff(eigenvalues)) + 1
-    #
-    # … is because we want at least two clusters
-    n_clusters = numpy.argmax(numpy.diff(eigenvalues[1:])) + 2
-
-    spectral_embeddings = wide_spectral_embeddings[:, :n_clusters]
-
-    spectral_embeddings = sklearn.preprocessing.normalize(spectral_embeddings)
-
-    labels = sklearn.cluster.KMeans(
-        n_clusters = n_clusters,
-        random_state = 0,
-        n_init = "auto"
-    ).fit_predict(spectral_embeddings)
-
-    groups = collections.OrderedDict()
-
-    for (label, entry, content, embedding) in zip(labels, entries, contents, embeddings):
-        groups.setdefault(label, []).append(Embed(entry, content, embedding))
-
-    return [ Cluster(embeds) for embeds in groups.values() ]
-
-@dataclass(frozen = True)
-class Tree:
-    label: str
-    files: list[str]
-    children: list["Tree"]
-
-def to_pattern(files: list[str]) -> str:
-    prefix = os.path.commonprefix(files)
-    suffix = os.path.commonprefix([ file[len(prefix):][::-1] for file in files ])[::-1]
-
-    if suffix:
-        if any([ file[len(prefix):-len(suffix)] for file in files ]):
-            star = "*"
-        else:
-            star = ""
-    else:
-        if any([ file[len(prefix):] for file in files ]):
-            star = "*"
-        else:
-            star = ""
-
-    if prefix:
-        if suffix:
-            return f"{prefix}{star}{suffix}: "
-        else:
-            return f"{prefix}{star}: "
-    else:
-        if suffix:
-            return f"{star}{suffix}: "
-        else:
-            return ""
-
-class Label(BaseModel):
-    overarchingTheme: str
-    distinguishingFeature: str
-    label: str
-    
-class Labels(BaseModel):
-    labels: list[Label]
-
-def to_files(trees: list[Tree]) -> list[str]:
-    return [ file for tree in trees for file in tree.files ]
-
-async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
-    children = cluster(c)
-
-    if len(children) == 1:
-        def render_embed(embed: Embed) -> str:
-            return f"# File: {embed.entry}\n\n{embed.content}"
-
-        rendered_embeds = "\n\n".join([ render_embed(embed) for embed in c.embeds ])
-
-        input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
-
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
-        )
-
-        assert response.output_parsed is not None
-
-        # assert len(response.output_parsed.labels) == len(c.embeds)
-
-        return [
-            Tree(f"{embed.entry}: {label.label}", [ embed.entry ], [])
-            for label, embed in zip(response.output_parsed.labels, c.embeds)
-        ]
-
-    else:
-        if depth == 0:
-            treess = await tqdm_asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
-                desc = "Labeling clusters",
-                unit = "cluster",
-                leave = False
-            )
-        else:
-            treess = await asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
-            )
-
-        def render_cluster(trees: list[Tree]) -> str:
-            rendered_trees = "\n".join([ tree.label for tree in trees ])
-
-            return f"# Cluster\n\n{rendered_trees}"
-
-        rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
-
-        input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
-
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
-        )
-
-        assert response.output_parsed is not None
-
-        # assert len(response.output_parsed.labels) == len(children)
-
-        return [
-            Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
-            for label, trees in zip(response.output_parsed.labels, treess)
-        ]
-
-async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    children = await label_nodes(facets, c, 0)
-
-    return Tree(label, to_files(children), children)
 
 class UI(textual.app.App):
+    BINDINGS = [("slash", "focus_search", "Search"), ("escape", "clear_search", "Clear")]
+
     def __init__(self, tree_):
         super().__init__()
         self.tree_ = tree_
 
     async def on_mount(self):
+        self.search_input = textual.widgets.Input(placeholder="Search (press / to focus)...")
+        self.search_input.display = False
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+        self._build_tree()
+        await self.mount(self.search_input)
+        await self.mount(self.treeview)
+
+    def _build_tree(self, filter_text: str = ""):
+        self.treeview.clear()
+        self.treeview.root.set_label(f"{self.tree_.label} ({len(self.tree_.files)})")
+
+        def matches(child: Tree, text: str) -> bool:
+            if text in child.label.lower():
+                return True
+            return any(text in f.lower() for f in child.files)
 
         def loop(node, children):
             for child in children:
+                if filter_text and not matches(child, filter_text):
+                    continue
                 if len(child.files) <= 1:
                     n = node.add(child.label)
                     n.allow_expand = False
                 else:
                     n = node.add(f"{child.label} ({len(child.files)})")
                     n.allow_expand = True
-
                     loop(n, child.children)
 
         loop(self.treeview.root, self.tree_.children)
+        if filter_text:
+            self.treeview.root.expand_all()
 
-        self.mount(self.treeview)
+    def action_focus_search(self):
+        self.search_input.display = True
+        self.search_input.focus()
+
+    def action_clear_search(self):
+        self.search_input.value = ""
+        self.search_input.display = False
+        self._build_tree()
+        self.treeview.focus()
+
+    def on_input_changed(self, event: textual.widgets.Input.Changed):
+        self._build_tree(event.value.strip().lower())
+
+
+def _handle_erase_models():
+    """Handle the --erase-models command."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+        if not cache_info.repos:
+            print("No downloaded models found.")
+            return
+        total_size = sum(r.size_on_disk for r in cache_info.repos)
+        print(f"Downloaded models ({total_size / 1e9:.1f} GB):")
+        for repo in sorted(cache_info.repos, key=lambda r: r.size_on_disk, reverse=True):
+            print(f"  {repo.repo_id} ({repo.size_on_disk / 1e9:.1f} GB)")
+        confirm = input("\nDelete all downloaded models? [y/N] ").strip().lower()
+        if confirm == "y":
+            delete_strategy = cache_info.delete_revisions(
+                [r.commit_hash for repo in cache_info.repos for r in repo.revisions]
+            )
+            delete_strategy.execute()
+            print("Done.")
+        else:
+            print("Aborted.")
+    except ImportError:
+        print("huggingface_hub is not installed.")
+
+
+def _flush_cache(repository: str):
+    """Delete cached labels for the given repository (preserves embeddings)."""
+    repo_dir = repo_cache_dir(repository)
+    if repo_dir.exists():
+        size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
+        shutil.rmtree(repo_dir)
+        print(f"Flushed repo cache for {repository} ({size / 1e6:.1f} MB)")
+    else:
+        print(f"No cache found.")
+
+
+def _show_status(repository: str):
+    """Show cache status for a repository."""
+    import os
+    from pathlib import Path
+
+    file_paths = _generate_paths(repository)
+
+    # Read files and compute content hashes
+    file_hashes: list[tuple[str, str]] = []  # (path, hash)
+    for path in file_paths:
+        try:
+            absolute_path = os.path.join(repository, path)
+            with open(absolute_path, "rb") as f:
+                text = f.read().decode("utf-8")
+            file_hashes.append((path, content_hash(f"{path}:\n\n{text}")))
+        except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError, PermissionError):
+            pass
+
+    total = len(file_hashes)
+
+    print(f"Repository: {repository} ({total} files)")
+    print()
+
+    # Label caches
+    repo_dir = repo_cache_dir(repository)
+    labels_dir = repo_dir / "labels"
+    if not labels_dir.exists():
+        print("Labels: no label caches found")
+        return
+
+    label_dirs = [d for d in labels_dir.iterdir() if d.is_dir()]
+    if not label_dirs:
+        print("Labels: no label caches found")
+        return
+
+    print(f"Labels ({len(label_dirs)} model {'identity' if len(label_dirs) == 1 else 'identities'}):")
+    for ldir in sorted(label_dirs):
+        cached_keys = list_cached_keys(ldir, ".json")
+        lbl_cached = sum(1 for _, h in file_hashes if h in cached_keys)
+        lbl_missing = total - lbl_cached
+        status = f"  [{ldir.name}]: {lbl_cached}/{total} cached"
+        if lbl_missing > 0:
+            status += f" ({lbl_missing} missing)"
+        print(status)
+        if lbl_missing > 0:
+            print("  Missing:")
+            for path, h in file_hashes:
+                if h not in cached_keys:
+                    print(f"    {path}")
+
+
+def _flush_labels(repository: str):
+    """Delete cached labels only (keeps embeddings)."""
+    repo_dir = repo_cache_dir(repository)
+    labels_dir = repo_dir / "labels"
+    if labels_dir.exists():
+        size = sum(f.stat().st_size for f in labels_dir.rglob("*") if f.is_file())
+        shutil.rmtree(labels_dir)
+        print(f"Flushed label cache for {repository} ({size / 1e6:.1f} MB)")
+    else:
+        print(f"No label cache found for {repository}")
+
+
+def _parse_cli_tool(remaining: list[str], parser: argparse.ArgumentParser) -> list[str] | None:
+    """Parse CLI tool from remaining args. Returns command list or None."""
+    if not remaining or not remaining[0].startswith("--"):
+        return None
+    tool_name = remaining[0][2:]
+    if shutil.which(tool_name) is None:
+        parser.error(f"CLI tool '{tool_name}' not found on PATH")
+    return [tool_name] + remaining[1:]
+
+
+def _build_model_identity(arguments: argparse.Namespace, cli_command: list[str] | None) -> str:
+    """Build model identity string from arguments."""
+    identity_parts = []
+    if arguments.local:
+        identity_parts.append(f"local:{arguments.local}")
+        if arguments.local_file:
+            identity_parts.append(f"file:{arguments.local_file}")
+    if cli_command:
+        identity_parts.append(f"cli:{shlex.join(cli_command)}")
+    if arguments.openai:
+        identity_parts.append(f"openai:{arguments.completion_model}")
+    return "+".join(identity_parts)
+
 
 def main():
     parser = argparse.ArgumentParser(
-        prog = "facets",
+        prog = "semantic-navigator",
         description = "Cluster documents by semantic facets",
     )
 
-    parser.add_argument("repository")
-    parser.add_argument("--completion-model", default = "gpt-5-mini")
-    parser.add_argument("--embedding-model", default = "text-embedding-3-large")
-    arguments = parser.parse_args()
+    parser.add_argument("repository", nargs = "?")
+    parser.add_argument("--embedding-model", default = "BAAI/bge-large-en-v1.5")
+    parser.add_argument("--gpu", action = "store_true")
+    parser.add_argument("--cpu", action = "store_true", help = "Add a CPU local model worker alongside GPU workers")
+    parser.add_argument("--cpu-offload", action = "store_true")
+    parser.add_argument("--device", type = str, default = "0", help = "GPU device IDs, comma-separated (e.g. 0,1)")
+    parser.add_argument("--gpu-layers", type = int, default = None)
+    parser.add_argument("--batch-size", type = int, default = None)
+    parser.add_argument("--concurrency", type = int, default = None)
+    parser.add_argument("--timeout", type = int, default = 60)
+    parser.add_argument("--list-devices", action = "store_true")
+    parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached labels for the given repository (preserves embeddings)")
+    parser.add_argument("--flush-labels", action = "store_true", help = "Delete cached labels only (keeps embeddings)")
+    parser.add_argument("--status", action = "store_true", help = "Show cache status for the repository")
+    parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
+    parser.add_argument("--openai", action = "store_true", help = "Use OpenAI API for labeling (requires OPENAI_API_KEY)")
+    parser.add_argument("--completion-model", default = "gpt-4o-mini", help = "OpenAI model for labeling (default: gpt-4o-mini)")
+    parser.add_argument("--openai-embedding-model", default = None, help = "OpenAI embedding model (default: text-embedding-3-small with --openai; 'local' to force fastembed)")
+    parser.add_argument("--local", default = None)
+    parser.add_argument("--local-file", default = None)
+    parser.add_argument("--n-ctx", type = int, default = None)
+    parser.add_argument("--debug", action = "store_true")
+    arguments, remaining = parser.parse_known_args()
 
-    facets = initialize(arguments.completion_model, arguments.embedding_model)
+    if arguments.list_devices:
+        list_devices()
+        return
+
+    if arguments.erase_models:
+        _handle_erase_models()
+        return
+
+    if arguments.repository is None:
+        parser.error("the following arguments are required: repository")
+
+    if arguments.flush_cache:
+        _flush_cache(arguments.repository)
+        return
+
+    if arguments.flush_labels:
+        _flush_labels(arguments.repository)
+        return
+
+    if arguments.status:
+        _show_status(arguments.repository)
+        return
+
+    cli_command = _parse_cli_tool(remaining, parser)
+    has_cli_tool = cli_command is not None
+
+    if arguments.local is None and not has_cli_tool and not arguments.openai:
+        parser.error("no backend specified (e.g. --openai, --gemini, --llm, or --local)")
+
+    if arguments.cpu_offload and not arguments.gpu:
+        parser.error("--cpu-offload requires --gpu")
+
+    if arguments.cpu and not arguments.gpu:
+        parser.error("--cpu only makes sense with --gpu (without --gpu, CPU is already the default)")
+
+    if arguments.gpu_layers is not None and arguments.local is None:
+        parser.error("--gpu-layers requires --local")
+
+    if arguments.local_file is not None and arguments.local is None:
+        parser.error("--local-file requires --local")
+
+    if arguments.n_ctx is not None and arguments.local is None:
+        parser.error("--n-ctx requires --local")
+
+    if arguments.concurrency is not None and arguments.local is not None and not has_cli_tool and not arguments.openai:
+        parser.error("--concurrency has no effect with --local only (local model concurrency is 1 per device)")
+
+    try:
+        devices = [int(d.strip()) for d in arguments.device.split(",")]
+    except ValueError:
+        parser.error(f"--device must be comma-separated integers, got: {arguments.device}")
+
+    if arguments.n_ctx is None:
+        arguments.n_ctx = 8192
+    if arguments.concurrency is None:
+        arguments.concurrency = 4
+
+    model_identity = _build_model_identity(arguments, cli_command)
+    openai_model = arguments.completion_model if arguments.openai else None
+
+    # When using --openai, default to OpenAI embeddings unless overridden with 'local'
+    if arguments.openai and arguments.openai_embedding_model is None:
+        arguments.openai_embedding_model = "text-embedding-3-small"
+    if arguments.openai_embedding_model == "local":
+        arguments.openai_embedding_model = None
+    embedding_model_name = arguments.embedding_model
+    if arguments.openai_embedding_model:
+        embedding_model_name = arguments.openai_embedding_model
+
+    facets = initialize(arguments.repository, model_identity, cli_command, arguments.local, arguments.local_file, embedding_model_name, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug, openai_model=openai_model, openai_embedding_model=arguments.openai_embedding_model)
 
     async def async_tasks():
-        initial_cluster = await embed(facets, arguments.repository)
+        timings: dict[str, float] = {}
+        total_start = time.monotonic()
 
-        tree_ = await tree(facets, arguments.repository, initial_cluster)
+        with timed("Reading & embedding", timings):
+            initial_cluster = await embed(facets, arguments.repository)
 
+        print(f"Processing {len(initial_cluster.embeds)} files...")
+        tree_ = await tree(facets, arguments.repository, initial_cluster, timings)
+
+        total = time.monotonic() - total_start
+        parts = " | ".join(f"{k}: {_fmt_time(v)}" for k, v in timings.items())
+        print(f"Done! Total: {_fmt_time(total)} ({parts})")
         return tree_
 
     tree_ = asyncio.run(async_tasks())
