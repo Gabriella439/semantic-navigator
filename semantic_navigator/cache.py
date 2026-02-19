@@ -2,6 +2,7 @@ import hashlib
 import numpy
 import os
 import sys
+import tempfile
 
 from numpy import float32
 from numpy.typing import NDArray
@@ -48,6 +49,21 @@ def list_cached_keys(directory: Path, suffix: str) -> set[str]:
     return {p.stem for p in directory.iterdir() if p.suffix == suffix}
 
 
+def _atomic_write_text(path: Path, data: str) -> None:
+    """Write text to a file atomically via temp file + rename."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
     path = directory / f"{key}.npy"
     if path.exists():
@@ -63,14 +79,18 @@ def save_cached_embedding(directory: Path, key: str, embedding: NDArray[float32]
 def load_cached_label(directory: Path, key: str) -> Label | None:
     path = directory / f"{key}.json"
     if path.exists():
-        return Label.model_validate_json(path.read_text())
+        try:
+            return Label.model_validate_json(path.read_text())
+        except Exception as e:
+            print(f"Warning: corrupt label cache {path}: {e}", file=sys.stderr)
+            return None
     return None
 
 
 def save_cached_label(directory: Path, key: str, label: Label) -> None:
     directory.mkdir(parents = True, exist_ok = True)
     path = directory / f"{key}.json"
-    path.write_text(label.model_dump_json())
+    _atomic_write_text(path, label.model_dump_json())
 
 
 def load_cached_cluster_labels(directory: Path, key: str) -> Labels | None:
@@ -87,4 +107,4 @@ def load_cached_cluster_labels(directory: Path, key: str) -> Labels | None:
 def save_cached_cluster_labels(directory: Path, key: str, labels: Labels) -> None:
     directory.mkdir(parents = True, exist_ok = True)
     path = directory / f"cluster-{key}.json"
-    path.write_text(labels.model_dump_json())
+    _atomic_write_text(path, labels.model_dump_json())

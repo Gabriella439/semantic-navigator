@@ -130,7 +130,7 @@ def _flush_cache(repository: str):
         print(f"No cache found.")
 
 
-def _show_status(repository: str, embedding_model: str):
+def _show_status(repository: str):
     """Show cache status for a repository."""
     import os
     from pathlib import Path
@@ -149,23 +149,8 @@ def _show_status(repository: str, embedding_model: str):
             pass
 
     total = len(file_hashes)
-    all_hashes = {h for _, h in file_hashes}
 
     print(f"Repository: {repository} ({total} files)")
-    print()
-
-    # Embedding cache
-    emb_dir = embedding_cache_dir(embedding_model)
-    cached_emb_keys = list_cached_keys(emb_dir, ".npy")
-    emb_cached = sum(1 for _, h in file_hashes if h in cached_emb_keys)
-    emb_missing = total - emb_cached
-    print(f"Embeddings ({embedding_model}):")
-    print(f"  {emb_cached}/{total} cached ({emb_missing} missing)")
-    if emb_missing > 0:
-        print("  Missing:")
-        for path, h in file_hashes:
-            if h not in cached_emb_keys:
-                print(f"    {path}")
     print()
 
     # Label caches
@@ -189,6 +174,11 @@ def _show_status(repository: str, embedding_model: str):
         if lbl_missing > 0:
             status += f" ({lbl_missing} missing)"
         print(status)
+        if lbl_missing > 0:
+            print("  Missing:")
+            for path, h in file_hashes:
+                if h not in cached_keys:
+                    print(f"    {path}")
 
 
 def _flush_labels(repository: str):
@@ -277,10 +267,7 @@ def main():
         return
 
     if arguments.status:
-        embedding_model_name = arguments.embedding_model
-        if arguments.openai_embedding_model:
-            embedding_model_name = arguments.openai_embedding_model
-        _show_status(arguments.repository, embedding_model_name)
+        _show_status(arguments.repository)
         return
 
     cli_command = _parse_cli_tool(remaining, parser)

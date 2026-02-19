@@ -335,48 +335,41 @@ class TestParseCliTool:
 class TestShowStatus:
     def test_no_files(self, tmp_path, capsys):
         """Empty directory shows 0 files."""
-        _show_status(str(tmp_path), "BAAI/bge-large-en-v1.5")
+        _show_status(str(tmp_path))
         out = capsys.readouterr().out
         assert "(0 files)" in out
-        assert "0/0 cached" in out
+        assert "no label caches found" in out
 
     def test_uncached_files(self, tmp_path, capsys):
-        """Files without cache show as missing."""
-        (tmp_path / "a.py").write_text("print('hello')", encoding="utf-8")
-        (tmp_path / "b.py").write_text("print('world')", encoding="utf-8")
-        _show_status(str(tmp_path), "BAAI/bge-large-en-v1.5")
-        out = capsys.readouterr().out
-        assert "(2 files)" in out
-        assert "0/2 cached (2 missing)" in out
-        assert "a.py" in out
-        assert "b.py" in out
-
-    def test_cached_embeddings(self, tmp_path, capsys):
-        """Files with cached embeddings show as cached."""
-        from semantic_navigator.cache import content_hash, embedding_cache_dir, save_cached_embedding
+        """Files without label cache show as missing."""
+        from semantic_navigator.cache import content_hash, label_cache_dir, save_cached_label
         from semantic_navigator.pipeline import _generate_paths
 
-        (tmp_path / "a.py").write_text("hello", encoding="utf-8")
-        # Compute the same hash the status function would use
-        paths = _generate_paths(str(tmp_path))
-        h = content_hash(f"{paths[0]}:\n\nhello")
-        emb_dir = embedding_cache_dir("test-model")
-        save_cached_embedding(emb_dir, h, numpy.zeros(3, dtype=float32))
+        (tmp_path / "a.py").write_text("print('hello')", encoding="utf-8")
+        (tmp_path / "b.py").write_text("print('world')", encoding="utf-8")
 
-        _show_status(str(tmp_path), "test-model")
+        # Create a label dir with no cached labels so the section appears
+        paths = _generate_paths(str(tmp_path))
+        h = content_hash(f"{paths[0]}:\n\nprint('hello')")
+        ldir = label_cache_dir(str(tmp_path), "test-identity")
+        save_cached_label(ldir, h, _label("test"))
+
+        _show_status(str(tmp_path))
         out = capsys.readouterr().out
-        assert "1/1 cached (0 missing)" in out
+        assert "(2 files)" in out
+        assert "1/2 cached" in out
+        assert "1 missing" in out
 
     def test_binary_files_skipped(self, tmp_path, capsys):
         """Binary files are skipped."""
         (tmp_path / "img.bin").write_bytes(b"\x80\x81\x82\x00\xff")
         (tmp_path / "a.py").write_text("code", encoding="utf-8")
-        _show_status(str(tmp_path), "BAAI/bge-large-en-v1.5")
+        _show_status(str(tmp_path))
         out = capsys.readouterr().out
         assert "(1 files)" in out
 
     def test_label_caches_shown(self, tmp_path, capsys):
-        """Label cache directories are enumerated."""
+        """Label cache directories are enumerated with missing files listed."""
         from semantic_navigator.cache import content_hash, label_cache_dir, save_cached_label
         from semantic_navigator.pipeline import _generate_paths
 
@@ -388,7 +381,7 @@ class TestShowStatus:
         ldir = label_cache_dir(str(tmp_path), "test-identity")
         save_cached_label(ldir, h, _label("test"))
 
-        _show_status(str(tmp_path), "BAAI/bge-large-en-v1.5")
+        _show_status(str(tmp_path))
         out = capsys.readouterr().out
         assert "1 model identity" in out
         assert "1/1 cached" in out
