@@ -11,7 +11,6 @@ import sklearn.cluster
 import sklearn.preprocessing
 import sklearn.utils
 import sklearn.utils.extmath
-import tiktoken
 
 from dulwich.errors import NotGitRepository
 from dulwich.repo import Repo
@@ -20,6 +19,7 @@ from numpy import float32
 from numpy.typing import NDArray
 from pathlib import PurePath
 from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 from typing import Iterable
 
@@ -30,30 +30,100 @@ from semantic_navigator.util import to_files, to_pattern
 
 max_clusters = 20
 
-max_tokens_per_embed = 8192
-
-max_tokens_per_batch_embed = 300000
+max_leaves = 20
 
 
-def initialize(completion_model: str, embedding_model: str) -> Facets:
+def initialize(
+    completion_model: str,
+    embedding_model_name: str,
+    openai_embedding_model: str | None = None,
+) -> Facets:
     from openai import AsyncOpenAI
 
     openai_client = AsyncOpenAI()
 
-    embedding_encoding = tiktoken.encoding_for_model(embedding_model)
-
-    try:
-        completion_encoding = tiktoken.encoding_for_model(completion_model)
-    except KeyError:
-        completion_encoding = tiktoken.get_encoding("o200k_base")
+    if openai_embedding_model is not None:
+        # OpenAI for embeddings
+        embedding = None
+    else:
+        # fastembed for local embeddings
+        from fastembed import TextEmbedding
+        print(f"Loading embedding model ({embedding_model_name})...")
+        embedding = TextEmbedding(model_name=embedding_model_name)
 
     return Facets(
         openai_client = openai_client,
-        embedding_model = embedding_model,
+        embedding_model = embedding,
+        embedding_model_name = embedding_model_name,
         completion_model = completion_model,
-        embedding_encoding = embedding_encoding,
-        completion_encoding = completion_encoding
+        openai_embedding_model = openai_embedding_model,
     )
+
+
+async def _read_file(directory: str, path: str) -> tuple[str, str] | None:
+    """Read a single file, returning (path, content) or None for non-text files."""
+    try:
+        absolute_path = os.path.join(directory, path)
+        async with aiofiles.open(absolute_path, "rb") as handle:
+            bytestring = await handle.read()
+            text = bytestring.decode("utf-8")
+            return (path, f"{path}:\n\n{text}")
+    except UnicodeDecodeError:
+        return None
+    except IsADirectoryError:
+        # Submodules or symlinks to directories
+        return None
+
+
+async def _embed_with_openai(facets: Facets, contents: list[str]) -> list[NDArray[float32]]:
+    """Embed contents using OpenAI API with token-aware chunking."""
+    import tiktoken
+    try:
+        encoding = tiktoken.encoding_for_model(facets.openai_embedding_model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    max_tokens_per_embed = 8192
+    max_embeds_per_batch = 2048
+
+    truncated_contents = []
+    for content in contents:
+        tokens = encoding.encode(content)
+        if len(tokens) > max_tokens_per_embed:
+            tokens = tokens[:max_tokens_per_embed]
+            truncated_contents.append(encoding.decode(tokens))
+        else:
+            truncated_contents.append(content)
+
+    async def openai_embed_batch(batch: list[str]) -> list[NDArray[float32]]:
+        response = await facets.openai_client.embeddings.create(
+            model = facets.openai_embedding_model,
+            input = batch,
+        )
+        return [numpy.asarray(datum.embedding, float32) for datum in response.data]
+
+    batches = list(batched(truncated_contents, max_embeds_per_batch))
+    new_embeddings_nested = await tqdm_asyncio.gather(
+        *(openai_embed_batch(list(batch)) for batch in batches),
+        desc = f"Embedding contents ({len(contents)} files)",
+        unit = "batch",
+        leave = False,
+    )
+    return [e for batch_result in new_embeddings_nested for e in batch_result]
+
+
+def _embed_with_fastembed(facets: Facets, contents: list[str]) -> list[NDArray[float32]]:
+    """Embed contents using fastembed."""
+    return [
+        numpy.asarray(e, float32)
+        for e in tqdm(
+            facets.embedding_model.embed(contents),
+            desc = f"Embedding contents ({len(contents)} files)",
+            unit = "file",
+            total = len(contents),
+            leave = False
+        )
+    ]
 
 
 async def embed(facets: Facets, directory: str) -> Cluster:
@@ -79,80 +149,24 @@ async def embed(facets: Facets, directory: str) -> Cluster:
                 if entry.is_file(follow_symlinks = False):
                     yield entry.path
 
-    async def read(path) -> list[tuple[str, str]]:
-        try:
-            absolute_path = os.path.join(directory, path)
-
-            async with aiofiles.open(absolute_path, "rb") as handle:
-                prefix = f"{path}:\n\n"
-
-                bytestring = await handle.read()
-
-                text = bytestring.decode("utf-8")
-
-                prefix_tokens = facets.embedding_encoding.encode(prefix)
-                text_tokens   = facets.embedding_encoding.encode(text)
-
-                max_tokens_per_chunk = max_tokens_per_embed - len(prefix_tokens)
-
-                return [
-                    (path, facets.embedding_encoding.decode(prefix_tokens + list(chunk)))
-
-                    # TODO: This currently only takes the first chunk because
-                    # GPT has trouble labeling chunks in order when multiple
-                    # chunks have the same file name.  Remove the `[:1]` when
-                    # this is fixed.
-                    for chunk in list(batched(text_tokens, max_tokens_per_chunk))[:1]
-                ]
-
-        except UnicodeDecodeError:
-            # Ignore files that aren't UTF-8
-            return [ ]
-
-        except IsADirectoryError:
-            # This can happen when a "file" listed by the repository is:
-            #
-            # - a submodule
-            # - a symlink to a directory
-            #
-            # TODO: The submodule case can and should be fixed and properly
-            # handled
-            return [ ]
-
     tasks = tqdm_asyncio.gather(
-        *(read(path) for path in generate_paths()),
+        *(_read_file(directory, path) for path in generate_paths()),
         desc = "Reading files",
         unit = "file",
         leave = False
     )
 
-    results = list(chain.from_iterable(await tasks))
+    results = [result for result in await tasks if result is not None]
 
     if not results:
         return Cluster([])
 
     paths, contents = zip(*results)
 
-    max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
-
-    async def embed_batch(input) -> list[NDArray[float32]]:
-        response = await facets.openai_client.embeddings.create(
-            model = facets.embedding_model,
-            input = input
-        )
-
-        return [
-            numpy.asarray(datum.embedding, float32) for datum in response.data
-        ]
-
-    tasks = tqdm_asyncio.gather(
-        *(embed_batch(input) for input in batched(contents, max_embeds)),
-        desc = "Embedding contents",
-        unit = "batch",
-        leave = False
-    )
-
-    embeddings = list(chain.from_iterable(await tasks))
+    if facets.openai_embedding_model is not None:
+        embeddings = await _embed_with_openai(facets, list(contents))
+    else:
+        embeddings = _embed_with_fastembed(facets, list(contents))
 
     embeds = [
         Embed(path, content, embedding)
@@ -161,15 +175,6 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     return Cluster(embeds)
 
-
-# The clustering algorithm can go as low as 1 here, but we set it higher for
-# two reasons:
-#
-# - it's easier for users to navigate when there is more branching at the
-#   leaves
-# - this also avoids straining the tree visualizer, which doesn't like a really
-#   deeply nested tree structure.
-max_leaves = 20
 
 def cluster(input: Cluster) -> list[Cluster]:
     N = len(input.embeds)
