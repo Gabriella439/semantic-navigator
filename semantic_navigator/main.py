@@ -481,8 +481,8 @@ def repo_cache_dir(repository: str) -> Path:
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
-def embedding_cache_dir(repository: str, model_name: str) -> Path:
-    return repo_cache_dir(repository) / "embeddings" / model_name.replace("/", "--")
+def embedding_cache_dir(model_name: str) -> Path:
+    return app_cache_dir() / "embeddings" / model_name.replace("/", "--")
 
 def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
     path = directory / f"{key}.npy"
@@ -580,7 +580,7 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     paths, contents = zip(*results)
 
-    cdir = embedding_cache_dir(facets.repository, facets.embedding_model_name)
+    cdir = embedding_cache_dir(facets.embedding_model_name)
     embeddings: list[NDArray[float32]] = [None] * len(contents)  # type: ignore[list-item]
     uncached_indices = []
 
@@ -1068,13 +1068,21 @@ def main():
         parser.error("the following arguments are required: repository")
 
     if arguments.flush_cache:
-        cache_dir = repo_cache_dir(arguments.repository)
-        if cache_dir.exists():
-            size = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
-            shutil.rmtree(cache_dir)
-            print(f"Flushed cache for {arguments.repository} ({size / 1e6:.1f} MB)")
-        else:
-            print(f"No cache found for {arguments.repository}")
+        repo_dir = repo_cache_dir(arguments.repository)
+        emb_dir = app_cache_dir() / "embeddings"
+        flushed = False
+        if repo_dir.exists():
+            size = sum(f.stat().st_size for f in repo_dir.rglob("*") if f.is_file())
+            shutil.rmtree(repo_dir)
+            print(f"Flushed label cache for {arguments.repository} ({size / 1e6:.1f} MB)")
+            flushed = True
+        if emb_dir.exists():
+            size = sum(f.stat().st_size for f in emb_dir.rglob("*") if f.is_file())
+            shutil.rmtree(emb_dir)
+            print(f"Flushed shared embedding cache ({size / 1e6:.1f} MB)")
+            flushed = True
+        if not flushed:
+            print(f"No cache found.")
         return
 
     # Extract CLI tool from unknown flags: --gemini → ["gemini"], --llm -m gpt-4o → ["llm", "-m", "gpt-4o"]
