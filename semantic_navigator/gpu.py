@@ -15,6 +15,8 @@ def list_devices():
             line.strip() for line in result.stdout.strip().splitlines()
             if line.strip() and line.strip() != "Name" and not line.strip().startswith("----")
         ]
+    elif sys.platform == "darwin":
+        names = _list_devices_macos()
     else:
         names = _list_devices_linux()
     print("GPU devices:")
@@ -54,6 +56,42 @@ def _list_devices_linux() -> list[str]:
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         print(f"Warning: rocm-smi failed: {e}", file=sys.stderr)
     return names
+
+
+def _list_devices_macos() -> list[str]:
+    """List GPU device names on macOS via system_profiler."""
+    names: list[str] = []
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                # "Chipset Model: Apple M2 Pro" or "Chipset Model: AMD Radeon Pro 5500M"
+                match = re.search(r"Chipset Model:\s*(.+)", line)
+                if match:
+                    names.append(match.group(1).strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"Warning: system_profiler failed: {e}", file=sys.stderr)
+    return names
+
+
+def _detect_gpu_memory_macos() -> list[int | None]:
+    """Detect GPU memory on macOS. Apple Silicon uses unified memory (system RAM = GPU RAM)."""
+    try:
+        # On Apple Silicon, GPU shares system memory
+        mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        # Count number of GPU devices
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True, text=True, timeout=10,
+        )
+        n_gpus = len(re.findall(r"Chipset Model:", result.stdout)) if result.returncode == 0 else 1
+        return [mem] * n_gpus
+    except (OSError, subprocess.TimeoutExpired, AttributeError) as e:
+        print(f"Warning: failed to detect macOS GPU memory: {e}", file=sys.stderr)
+        return []
 
 
 gguf_quant_preference = [
@@ -167,6 +205,8 @@ def detect_device_memory(gpu: bool, device: int) -> int | None:
         if _gpu_memory_cache is None:
             if sys.platform == "win32":
                 _gpu_memory_cache = _detect_gpu_memory_windows()
+            elif sys.platform == "darwin":
+                _gpu_memory_cache = _detect_gpu_memory_macos()
             else:
                 _gpu_memory_cache = _detect_gpu_memory_linux()
         if device < len(_gpu_memory_cache):

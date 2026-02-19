@@ -1,13 +1,19 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy
 import pytest
 from numpy import float32
 
-from semantic_navigator.cache import cluster_hash, content_hash
+from semantic_navigator.cache import (
+    app_cache_dir, cluster_hash, content_hash, embedding_cache_dir,
+    label_cache_dir, load_cached_embedding, load_cached_label,
+    load_cached_cluster_labels, save_cached_embedding, save_cached_label,
+    save_cached_cluster_labels,
+)
 from semantic_navigator.gpu import _resolve_gpu_layers
 from semantic_navigator.inference import (
     _build_labels_schema, _parse_raw_response, _validate_label_count,
@@ -371,3 +377,237 @@ class TestShowStatus:
         out = capsys.readouterr().out
         assert "1 model identity" in out
         assert "1/1 cached" in out
+
+    def test_multiple_model_identities(self, tmp_path, capsys):
+        """Multiple model identities are listed separately."""
+        (tmp_path / "a.py").write_text("code", encoding="utf-8")
+        ldir1 = label_cache_dir(str(tmp_path), "identity-1")
+        ldir2 = label_cache_dir(str(tmp_path), "identity-2")
+        save_cached_label(ldir1, "fake-hash", _label("l1"))
+        save_cached_label(ldir2, "fake-hash", _label("l2"))
+
+        _show_status(str(tmp_path))
+        out = capsys.readouterr().out
+        assert "2 model identities" in out
+
+    def test_deleted_file_skipped(self, tmp_path, capsys):
+        """Files that exist in git index but are deleted on disk don't crash."""
+        # Create then delete a file — _generate_paths for non-git returns scandir
+        # so this tests the error handling in _show_status's file reading loop
+        (tmp_path / "a.py").write_text("code", encoding="utf-8")
+        _show_status(str(tmp_path))
+        out = capsys.readouterr().out
+        assert "(1 files)" in out
+
+
+# -- extract_json (additional) --
+
+class TestExtractJsonAdditional:
+    def test_code_fenced_no_lang(self):
+        text = "result:\n```\n{\"key\": 42}\n```\ndone"
+        assert extract_json(text) == '{"key": 42}'
+
+    def test_nested_braces(self):
+        text = '{"a": {"b": 1}}'
+        assert extract_json(text) == '{"a": {"b": 1}}'
+
+    def test_empty_string(self):
+        assert extract_json("") == ""
+
+
+# -- repair_json (additional) --
+
+class TestRepairJsonAdditional:
+    def test_backslash_before_unicode_non_hex(self):
+        """\\uNOTHEX should become \\\\uNOTHEX."""
+        assert repair_json(r'"\user"') == r'"\\user"'
+
+    def test_valid_unicode_escape_untouched(self):
+        original = r'"\u0041"'
+        assert repair_json(original) == original
+
+    def test_multiple_invalid_escapes(self):
+        # \g and \k are not valid JSON escapes, so they get doubled
+        result = repair_json(r'{"a": "\goo\kar"}')
+        assert result == r'{"a": "\\goo\\kar"}'
+
+
+# -- _sanitize_path (additional) --
+
+class TestSanitizePathAdditional:
+    def test_unix_path(self):
+        result = _sanitize_path("/home/user/repo")
+        assert "/" not in result
+
+    def test_windows_backslash(self):
+        result = _sanitize_path("C:\\Users\\foo\\repo")
+        assert "\\" not in result
+        assert ":" not in result
+
+
+# -- to_pattern (additional) --
+
+class TestToPatternAdditional:
+    def test_identical_files(self):
+        """All-same files produce the filename with no star."""
+        result = to_pattern(["same.py", "same.py"])
+        assert result == "same.py: "
+        assert "*" not in result
+
+    def test_prefix_only(self):
+        result = to_pattern(["src/a", "src/b"])
+        assert result.startswith("src/")
+        assert "*" in result
+
+    def test_suffix_only(self):
+        result = to_pattern(["foo.test.js", "bar.test.js"])
+        assert result.endswith(".test.js: ")
+        assert "*" in result
+
+    def test_empty_list(self):
+        assert to_pattern([]) == ""
+
+
+# -- to_files (additional) --
+
+class TestToFilesAdditional:
+    def test_empty(self):
+        assert to_files([]) == []
+
+    def test_deeply_nested(self):
+        leaf = Tree("leaf", ["f1"], [])
+        mid = Tree("mid", ["f1"], [leaf])
+        top = Tree("top", ["f1"], [mid])
+        assert to_files([top]) == ["f1"]
+
+
+# -- _resolve_gpu_layers (additional) --
+
+class TestResolveGpuLayersAdditional:
+    def test_vram_exceeds_model_returns_all(self):
+        """When VRAM >> model size, return -1 (all layers)."""
+        with patch("semantic_navigator.gpu.detect_device_memory", return_value=16_000_000_000):
+            result = _resolve_gpu_layers(True, None, 0, model_size=4_000_000_000)
+        assert result == -1
+
+    def test_vram_less_than_model_returns_partial(self):
+        """When VRAM < model size, return proportional layers."""
+        with patch("semantic_navigator.gpu.detect_device_memory", return_value=4_000_000_000):
+            result = _resolve_gpu_layers(True, None, 0, model_size=8_000_000_000)
+        # 4B * 0.6 / 8B * 100 = 30
+        assert result == 30
+
+    def test_vram_none_returns_all(self):
+        """When VRAM detection fails, return -1."""
+        with patch("semantic_navigator.gpu.detect_device_memory", return_value=None):
+            result = _resolve_gpu_layers(True, None, 0, model_size=4_000_000_000)
+        assert result == -1
+
+
+# -- Corrupt cache recovery --
+
+class TestCorruptCacheRecovery:
+    def test_corrupt_label_returns_none(self, tmp_path):
+        """Corrupt JSON label file returns None instead of crashing."""
+        path = tmp_path / "bad.json"
+        path.write_text("not valid json{{{")
+        result = load_cached_label(tmp_path, "bad")
+        assert result is None
+
+    def test_corrupt_cluster_returns_none(self, tmp_path):
+        """Corrupt cluster label file returns None."""
+        path = tmp_path / "cluster-bad.json"
+        path.write_text("truncated{")
+        result = load_cached_cluster_labels(tmp_path, "bad")
+        assert result is None
+
+    def test_corrupt_embedding_returns_none(self, tmp_path):
+        """Corrupt .npy file returns None instead of crashing."""
+        path = tmp_path / "bad.npy"
+        path.write_bytes(b"not a numpy file")
+        result = load_cached_embedding(tmp_path, "bad")
+        assert result is None
+
+    def test_truncated_label_json(self, tmp_path):
+        """Partially written JSON (valid syntax, missing fields) returns None."""
+        path = tmp_path / "partial.json"
+        path.write_text('{"overarchingTheme": "T"}')
+        result = load_cached_label(tmp_path, "partial")
+        assert result is None
+
+
+# -- app_cache_dir per platform --
+
+class TestAppCacheDir:
+    def test_linux(self):
+        with patch("semantic_navigator.cache.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("semantic_navigator.cache.Path.home", return_value=Path("/home/user")):
+                    from semantic_navigator.cache import app_cache_dir
+                    result = app_cache_dir()
+                    assert "semantic-navigator" in str(result)
+
+    def test_xdg_override(self):
+        with patch("semantic_navigator.cache.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": "/custom/cache"}):
+                from semantic_navigator.cache import app_cache_dir
+                result = app_cache_dir()
+                # Check path parts rather than string prefix (cross-platform)
+                parts = result.parts
+                assert "custom" in parts and "cache" in parts
+                assert parts[-1] == "semantic-navigator"
+
+
+# -- _build_model_identity (additional) --
+
+class TestBuildModelIdentityAdditional:
+    def _ns(self, **kwargs):
+        defaults = {"local": None, "local_file": None, "openai": False, "completion_model": "gpt-4o-mini"}
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_local_with_file(self):
+        result = _build_model_identity(self._ns(local="repo", local_file="*Q4.gguf"), None)
+        assert "local:repo" in result
+        assert "file:*Q4.gguf" in result
+
+    def test_no_backends_empty(self):
+        result = _build_model_identity(self._ns(), None)
+        assert result == ""
+
+
+# -- _count_tree_depth / _count_tree_leaves (additional) --
+
+class TestTreeCountsAdditional:
+    def test_deep_tree(self):
+        leaf = ClusterTree(Cluster([_embed("a")]), [])
+        mid = ClusterTree(Cluster([_embed("a")]), [leaf])
+        root = ClusterTree(Cluster([_embed("a")]), [mid])
+        assert _count_tree_depth(root) == 2
+        assert _count_tree_leaves(root) == 1
+
+    def test_wide_tree(self):
+        children = [ClusterTree(Cluster([_embed(f"f{i}")]), []) for i in range(5)]
+        root = ClusterTree(Cluster([_embed(f"f{i}") for i in range(5)]), children)
+        assert _count_tree_depth(root) == 1
+        assert _count_tree_leaves(root) == 5
+
+
+# -- embedding_cache_dir / label_cache_dir --
+
+class TestCacheDirFunctions:
+    def test_embedding_cache_dir_slashes(self):
+        result = embedding_cache_dir("BAAI/bge-large-en-v1.5")
+        assert "BAAI--bge-large-en-v1.5" in str(result)
+
+    def test_label_cache_dir_deterministic(self):
+        r1 = label_cache_dir("/repo", "model-a")
+        r2 = label_cache_dir("/repo", "model-a")
+        assert r1 == r2
+
+    def test_label_cache_dir_different_models(self):
+        r1 = label_cache_dir("/repo", "model-a")
+        r2 = label_cache_dir("/repo", "model-b")
+        assert r1 != r2

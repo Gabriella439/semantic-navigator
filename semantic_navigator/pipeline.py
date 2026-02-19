@@ -18,7 +18,7 @@ from dulwich.repo import Repo
 from fastembed import TextEmbedding
 from numpy import float32
 from numpy.typing import NDArray
-from pathlib import PurePath
+from pathlib import PurePath, PurePosixPath
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
@@ -41,22 +41,28 @@ max_leaves = 20
 
 
 def _generate_paths(directory: str) -> list[str]:
-    """Generate file paths from git index or directory scan."""
+    """Generate file paths from git index or directory scan.
+    Returns forward-slash paths for consistent cache keys across platforms."""
     try:
         repo = Repo.discover(directory)
         paths = []
+        # Normalize both to PurePosixPath for cross-platform consistency:
+        # - repo.path may use OS-native separators
+        # - git index paths always use forward slashes
+        repo_root = PurePosixPath(PurePath(repo.path).as_posix())
+        subdir = PurePosixPath(PurePath(directory).as_posix())
+        subdirectory = subdir.relative_to(repo_root)
         for bytestring in repo.open_index().paths():
-            path = bytestring.decode("utf-8")
-            subdirectory = PurePath(directory).relative_to(repo.path)
+            path = bytestring.decode("utf-8")  # already forward-slash
             try:
-                relative_path = PurePath(path).relative_to(subdirectory)
+                relative_path = PurePosixPath(path).relative_to(subdirectory)
                 paths.append(str(relative_path))
             except ValueError:
                 pass
         return paths
     except NotGitRepository:
         return [
-            entry.path for entry in os.scandir(directory)
+            entry.name for entry in os.scandir(directory)
             if entry.is_file(follow_symlinks = False)
         ]
 

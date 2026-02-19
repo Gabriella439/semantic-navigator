@@ -14,11 +14,13 @@ Currently I've only built and run this script using uv and Nix.  However, you
 can feel free to submit pull requests for other installation instructions if
 you've vetted them.
 
-You will need either a CLI AI tool installed and configured for authentication
-(any tool that reads from stdin and writes to stdout will work, e.g. `gemini`,
-`llm`, `aichat`), or you can use a local LLM via `--local` (see below).
+You will need a labeling backend — one of:
+- A CLI AI tool that reads from stdin and writes to stdout (e.g. `gemini`, `llm`, `aichat`)
+- OpenAI API via `--openai` (requires `OPENAI_API_KEY`)
+- A local GGUF model via `--local`
 
-Note: On first run, the embedding model (~130MB) will be downloaded automatically.
+You can combine multiple backends (e.g. `--local model --openai`) and work will
+be distributed across them.
 
 ### uv
 
@@ -77,6 +79,9 @@ $ semantic-navigator ./path/to/repository --llm -m gpt-4o
 $ semantic-navigator --aichat ./path/to/repository
 ```
 
+Any CLI tool that reads a prompt from stdin and writes its response to stdout
+will work — just pass `--<tool-name>` and any additional arguments.
+
 ### OpenAI
 
 You can use OpenAI directly via `--openai`. Install the optional dependency
@@ -89,14 +94,17 @@ $ uv sync --extra openai
 Then run with `--openai`:
 
 ```ShellSession
-# Default model (gpt-4o-mini)
+# Default (gpt-4o-mini for labeling, text-embedding-3-small for embeddings)
 $ semantic-navigator --openai ./path/to/repository
 
 # Custom completion model
 $ semantic-navigator --openai --completion-model gpt-4o ./path/to/repository
 
-# Use OpenAI for both labeling and embeddings
+# Higher-quality embeddings
 $ semantic-navigator --openai --openai-embedding-model text-embedding-3-large ./path/to/repository
+
+# OpenAI for labeling, local fastembed for embeddings
+$ semantic-navigator --openai --openai-embedding-model local ./path/to/repository
 ```
 
 This requires the `OPENAI_API_KEY` environment variable to be set.
@@ -116,20 +124,101 @@ Then use `--local` with either a local file path or a Hugging Face repo ID:
 # Local GGUF file
 $ semantic-navigator --local ./models/qwen2.5-7b-q4_k_m.gguf ./repo
 
-# Hugging Face repo (auto-downloads, default quantization: Q4_K_M)
+# Hugging Face repo (auto-selects best quantization for your hardware)
 $ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF ./repo
 
 # Specific quantization
 $ semantic-navigator --local bartowski/Qwen2.5-7B-Instruct-GGUF --local-file "*Q8_0.gguf" ./repo
-
-# With GPU offloading (Vulkan on AMD, CUDA on NVIDIA)
-$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu ./repo
 ```
 
-When `--gpu` is used with `--local`, all model layers are offloaded to the GPU
-via whichever backend `llama-cpp-python` was compiled with (Vulkan, CUDA, etc.).
-The `--gpu` flag also enables DirectML for the embedding model (existing
-behavior).
+### GPU acceleration
+
+Use `--gpu` to enable GPU offloading for both the embedding model (DirectML)
+and local LLM inference (Vulkan, CUDA, etc.):
+
+```ShellSession
+# GPU-accelerated local model
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu ./repo
+
+# Multiple GPUs (work distributed across devices)
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu --device 0,1 ./repo
+
+# GPU for local model + CPU fallback worker
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu --cpu ./repo
+
+# GPU with CPU offload for embeddings
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu --cpu-offload ./repo
+```
+
+Install the GPU extra for DirectML-accelerated embeddings:
+
+```ShellSession
+$ uv sync --extra gpu
+```
+
+To see available GPU devices and their VRAM:
+
+```ShellSession
+$ semantic-navigator --list-devices
+```
+
+When auto-selecting a GGUF quantization from Hugging Face, the tool picks the
+largest model that fits in 60% of available VRAM (reserving space for KV cache
+and runtime overhead).
+
+### Combining backends
+
+You can use multiple backends simultaneously — work is distributed across them:
+
+```ShellSession
+# Local model + OpenAI running in parallel
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --openai ./repo
+
+# Local model + CLI tool
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gemini ./repo
+```
+
+### Advanced options
+
+```
+--concurrency N       Number of concurrent workers for CLI/OpenAI backends (default: 4)
+--n-ctx N             Context window size for local models (default: 8192)
+--gpu-layers N        Override automatic GPU layer count for local models
+--batch-size N        Embedding batch size (default: 256 CPU, 32 GPU)
+--timeout N           Timeout in seconds for CLI tool calls (default: 60)
+--embedding-model M   Override fastembed model (default: BAAI/bge-large-en-v1.5)
+--debug               Print prompts, raw outputs, and debug info
+```
+
+## Caching
+
+Results are cached to avoid redundant work on subsequent runs:
+
+- **Embeddings** are cached globally (shared across repositories) since they
+  depend only on file content, not the labeling model
+- **Labels** are cached per-repository and per-model-identity, so switching
+  backends produces fresh labels
+
+Cache management commands:
+
+```ShellSession
+# Show label cache coverage for a repository
+$ semantic-navigator --status ./repo
+
+# Delete label cache for a repository (keeps embeddings)
+$ semantic-navigator --flush-labels ./repo
+
+# Delete all cached data for a repository (labels + repo metadata)
+$ semantic-navigator --flush-cache ./repo
+
+# Delete downloaded HuggingFace models
+$ semantic-navigator --erase-models
+```
+
+If the tool crashes during labeling, completed labels are preserved — the next
+run picks up where it left off.
+
+## How it works
 
 For small repositories (up to 20 files) you won't see any clusters and the tool
 will just summarize the individual files:
@@ -139,7 +228,7 @@ will just summarize the individual files:
 This is a tradeoff the tool makes for ergonomic reasons: the tool avoids
 subdividing clusters with 20 files or fewer.
 
-For a a medium-sized repository you'll begin to see top-level clusters:
+For a medium-sized repository you'll begin to see top-level clusters:
 
 ![](./images/medium.png)
 
@@ -186,4 +275,10 @@ $ nix develop
 $ nix run . -- ./path/to/repository
 ```
 
-Embeddings are generated locally using [fastembed](https://github.com/qdrant/fastembed) (ONNX-based), so no API key is needed for the embedding step.
+To run the test suite:
+
+```ShellSession
+$ uv run pytest
+```
+
+Embeddings are generated locally by default using [fastembed](https://github.com/qdrant/fastembed) (ONNX-based), so no API key is needed for the embedding step (unless you opt into OpenAI embeddings via `--openai`).

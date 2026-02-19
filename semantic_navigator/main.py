@@ -216,7 +216,7 @@ def main():
     parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
     parser.add_argument("--openai", action = "store_true", help = "Use OpenAI API for labeling (requires OPENAI_API_KEY)")
     parser.add_argument("--completion-model", default = "gpt-4o-mini", help = "OpenAI model for labeling (default: gpt-4o-mini)")
-    parser.add_argument("--openai-embedding-model", default = None, help = "Use OpenAI API for embeddings (e.g. text-embedding-3-large)")
+    parser.add_argument("--openai-embedding-model", default = None, help = "OpenAI embedding model (default: text-embedding-3-small with --openai; 'local' to force fastembed)")
     parser.add_argument("--local", default = None)
     parser.add_argument("--local-file", default = None)
     parser.add_argument("--n-ctx", type = int, default = None)
@@ -283,7 +283,11 @@ def main():
     model_identity = _build_model_identity(arguments, cli_command)
     openai_model = arguments.completion_model if arguments.openai else None
 
-    # When using --openai with --openai-embedding-model, override the embedding model name for cache identity
+    # When using --openai, default to OpenAI embeddings unless overridden with 'local'
+    if arguments.openai and arguments.openai_embedding_model is None:
+        arguments.openai_embedding_model = "text-embedding-3-small"
+    if arguments.openai_embedding_model == "local":
+        arguments.openai_embedding_model = None
     embedding_model_name = arguments.embedding_model
     if arguments.openai_embedding_model:
         embedding_model_name = arguments.openai_embedding_model

@@ -14,6 +14,8 @@ from semantic_navigator.models import Label, Labels
 def app_cache_dir() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / "Library" / "Caches"))
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return base / "semantic-navigator"
@@ -64,16 +66,36 @@ def _atomic_write_text(path: Path, data: str) -> None:
         raise
 
 
+def _atomic_write_numpy(path: Path, array: NDArray[float32]) -> None:
+    """Write a numpy array to a file atomically via temp file + rename."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".npy")
+    try:
+        os.close(fd)
+        # numpy.save appends .npy if missing; using .npy suffix avoids double extension
+        numpy.save(tmp, array)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
     path = directory / f"{key}.npy"
     if path.exists():
-        return numpy.load(path).astype(float32)
+        try:
+            return numpy.load(path).astype(float32)
+        except Exception as e:
+            print(f"Warning: corrupt embedding cache {path}: {e}", file=sys.stderr)
+            return None
     return None
 
 
 def save_cached_embedding(directory: Path, key: str, embedding: NDArray[float32]) -> None:
     directory.mkdir(parents = True, exist_ok = True)
-    numpy.save(directory / f"{key}.npy", embedding)
+    _atomic_write_numpy(directory / f"{key}.npy", embedding)
 
 
 def load_cached_label(directory: Path, key: str) -> Label | None:

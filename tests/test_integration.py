@@ -408,3 +408,250 @@ class TestPipelineIntegration:
             Tree("main.py: Entry point", ["main.py"], []),
         ]
         assert to_files(outer) == ["a.py", "b.py", "main.py"]
+
+
+# ---------------------------------------------------------------------------
+# AspectPool.remove() — drains queue and removes dead aspect
+# ---------------------------------------------------------------------------
+
+class TestAspectPoolRemove:
+    def test_remove_drains_dead_aspect(self):
+        a1, a2, a3 = _make_aspect("a"), _make_aspect("b"), _make_aspect("c")
+        pool = AspectPool([a1, a2, a3])
+
+        async def run():
+            # Acquire one to populate the queue
+            got = await pool.acquire()
+            pool.release(got)
+            # Remove a2
+            remaining = pool.remove(a2)
+            assert remaining == 2
+            assert a2 not in pool.aspects
+            # Verify we can only acquire a1 and a3
+            acquired = set()
+            acquired.add((await pool.acquire()).name)
+            acquired.add((await pool.acquire()).name)
+            assert acquired == {"a", "c"}
+
+        asyncio.run(run())
+
+    def test_remove_last_aspect(self):
+        a = _make_aspect("only")
+        pool = AspectPool([a])
+
+        async def run():
+            await pool.acquire()
+            remaining = pool.remove(a)
+            assert remaining == 0
+            assert pool.aspects == []
+
+        asyncio.run(run())
+
+    def test_remove_aspect_not_in_queue(self):
+        """Remove an aspect that was acquired (not in queue) still removes from list."""
+        a1, a2 = _make_aspect("a"), _make_aspect("b")
+        pool = AspectPool([a1, a2])
+
+        async def run():
+            got = await pool.acquire()  # removes from queue
+            remaining = pool.remove(got)
+            assert remaining == 1
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Corrupt cache recovery in integration context
+# ---------------------------------------------------------------------------
+
+class TestCorruptCacheIntegration:
+    def test_corrupt_label_triggers_relabel(self, tmp_path: Path):
+        """Corrupt label cache returns None, treated as uncached."""
+        (tmp_path / "bad-hash.json").write_text("{{invalid")
+        from semantic_navigator.cache import load_cached_label
+        result = load_cached_label(tmp_path, "bad-hash")
+        assert result is None
+
+    def test_corrupt_embedding_triggers_recompute(self, tmp_path: Path):
+        """Corrupt embedding returns None, treated as uncached."""
+        (tmp_path / "bad.npy").write_bytes(b"\x00\x01\x02")
+        from semantic_navigator.cache import load_cached_embedding
+        result = load_cached_embedding(tmp_path, "bad")
+        assert result is None
+
+    def test_overwrite_corrupt_with_valid(self, tmp_path: Path):
+        """Saving over a corrupt file produces a valid cached entry."""
+        (tmp_path / "key.json").write_text("corrupt")
+        assert load_cached_label(tmp_path, "key") is None
+        save_cached_label(tmp_path, "key", _label("fixed"))
+        loaded = load_cached_label(tmp_path, "key")
+        assert loaded is not None
+        assert loaded.label == "fixed"
+
+
+# ---------------------------------------------------------------------------
+# _generate_paths forward-slash consistency
+# ---------------------------------------------------------------------------
+
+class TestGeneratePathsConsistency:
+    def test_paths_use_forward_slashes(self, tmp_path: Path):
+        """All returned paths use forward slashes regardless of OS."""
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        (subdir / "file.py").write_text("code")
+        # scandir fallback only lists immediate children, so test top-level
+        (tmp_path / "top.py").write_text("top")
+        paths = _generate_paths(str(tmp_path))
+        for p in paths:
+            assert "\\" not in p, f"Path contains backslash: {p}"
+
+    def test_empty_directory(self, tmp_path: Path):
+        paths = _generate_paths(str(tmp_path))
+        assert paths == []
+
+    def test_only_binary_files(self, tmp_path: Path):
+        """Directory with only binary files still returns paths (filtering happens in _read_file)."""
+        (tmp_path / "img.bin").write_bytes(b"\x80\x81")
+        paths = _generate_paths(str(tmp_path))
+        assert len(paths) == 1
+
+
+# ---------------------------------------------------------------------------
+# _read_file edge cases
+# ---------------------------------------------------------------------------
+
+class TestReadFileEdgeCases:
+    def test_empty_file(self, tmp_path: Path):
+        (tmp_path / "empty.py").write_text("")
+
+        async def run():
+            return await _read_file(str(tmp_path), "empty.py")
+
+        result = asyncio.run(run())
+        assert result is not None
+        path, content = result
+        assert path == "empty.py"
+        assert "empty.py:\n\n" in content
+
+    def test_unicode_content(self, tmp_path: Path):
+        (tmp_path / "uni.py").write_text("# 日本語コメント\nprint('hello')", encoding="utf-8")
+
+        async def run():
+            return await _read_file(str(tmp_path), "uni.py")
+
+        result = asyncio.run(run())
+        assert result is not None
+        assert "日本語" in result[1]
+
+    def test_nonexistent_file(self, tmp_path: Path):
+        async def run():
+            return await _read_file(str(tmp_path), "does_not_exist.py")
+
+        # Should not crash — returns None or raises handled exception
+        try:
+            result = asyncio.run(run())
+        except FileNotFoundError:
+            pass  # acceptable
+
+
+# ---------------------------------------------------------------------------
+# Empty cluster through pipeline
+# ---------------------------------------------------------------------------
+
+class TestEmptyCluster:
+    def test_empty_cluster_returns_single(self):
+        """Cluster with no embeds returns itself as single cluster."""
+        c = Cluster([])
+        result = cluster(c)
+        assert len(result) == 1
+        assert result[0] is c
+
+    def test_empty_cluster_tree(self):
+        c = Cluster([])
+        ct = build_cluster_tree(c)
+        assert ct.children == []
+        assert ct.node is c
+
+    def test_single_file_cluster(self):
+        """Cluster with one file is a leaf."""
+        e = _embed("only.py")
+        c = Cluster([e])
+        ct = build_cluster_tree(c)
+        assert ct.children == []
+        from semantic_navigator.pipeline import _count_tree_leaves
+        assert _count_tree_leaves(ct) == 1
+
+
+# ---------------------------------------------------------------------------
+# Atomic write behavior
+# ---------------------------------------------------------------------------
+
+class TestAtomicWrites:
+    def test_label_write_no_temp_files_left(self, tmp_path: Path):
+        """After save, no .tmp files remain in the directory."""
+        save_cached_label(tmp_path, "k1", _label("test"))
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        assert tmp_files == []
+
+    def test_embedding_write_no_temp_files_left(self, tmp_path: Path):
+        import numpy
+        vec = numpy.array([1.0, 2.0], dtype=float32)
+        save_cached_embedding(tmp_path, "k1", vec)
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        npy_tmps = list(tmp_path.glob("*.npy.npy"))
+        assert tmp_files == []
+        assert npy_tmps == [], "Double .npy extension detected"
+
+    def test_cluster_label_write_no_temp_files(self, tmp_path: Path):
+        labels = Labels(labels=[_label("a")])
+        save_cached_cluster_labels(tmp_path, "ck", labels)
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        assert tmp_files == []
+
+    def test_overwrite_existing_label(self, tmp_path: Path):
+        """Overwriting a label produces valid data (atomic replace)."""
+        save_cached_label(tmp_path, "k", _label("old"))
+        save_cached_label(tmp_path, "k", _label("new"))
+        loaded = load_cached_label(tmp_path, "k")
+        assert loaded.label == "new"
+
+
+# ---------------------------------------------------------------------------
+# Cached label reuse in label_nodes
+# ---------------------------------------------------------------------------
+
+class TestLabelNodesCachedReuse:
+    def test_cached_labels_skip_inference(self, tmp_path: Path):
+        """When all labels are cached, complete() is never called."""
+        e1 = _embed("a.py")
+        ct = ClusterTree(Cluster([e1]), [])
+        cached_label = _label("Cached Label")
+
+        call_count = 0
+
+        async def mock_complete(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return Labels(labels=[_label("Should Not Appear")])
+
+        async def run():
+            from unittest.mock import MagicMock
+            from tqdm import tqdm
+
+            progress = tqdm(disable=True)
+            facets_mock = MagicMock(
+                repository="/r", model_identity="id",
+                pool=MagicMock(min_local_n_ctx=None),
+            )
+
+            with patch("semantic_navigator.pipeline.complete", side_effect=mock_complete), \
+                 patch("semantic_navigator.pipeline.label_cache_dir", return_value=tmp_path), \
+                 patch("semantic_navigator.pipeline.load_cached_label", return_value=cached_label), \
+                 patch("semantic_navigator.pipeline.save_cached_label"):
+                trees = await label_nodes(facets_mock, ct, progress)
+            return trees
+
+        trees = asyncio.run(run())
+        assert len(trees) == 1
+        assert "Cached Label" in trees[0].label
+        assert call_count == 0, "complete() should not be called when all labels are cached"

@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -344,7 +345,12 @@ def _create_embedding_model(openai_embedding_model: str | None, embedding_model:
 
     if gpu:
         device = devices[0]
-        providers = [("DmlExecutionProvider", {"device_id": device})]
+        if sys.platform == "win32":
+            providers = [("DmlExecutionProvider", {"device_id": device})]
+        elif sys.platform == "darwin":
+            providers = ["CoreMLExecutionProvider"]
+        else:
+            providers = [("CUDAExecutionProvider", {"device_id": str(device)})]
         if cpu_offload:
             providers.append("CPUExecutionProvider")
     else:
