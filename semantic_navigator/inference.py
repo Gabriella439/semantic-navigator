@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import shlex
+import subprocess
 import sys
 
 from pydantic import BaseModel
@@ -76,6 +78,30 @@ async def _invoke_local(aspect: Aspect, prompt: str, expected_count: int | None)
     return await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt, response_format)
 
 
+async def _invoke_cli(aspect: Aspect, facets: Facets, prompt: str) -> str:
+    """Call CLI subprocess. Raises RuntimeError on non-zero exit."""
+    if facets.debug:
+        print(f"[debug] command: {shlex.join(aspect.cli_command)}")
+    loop = asyncio.get_running_loop()
+    cli_result = await loop.run_in_executor(None, lambda: subprocess.run(
+        aspect.cli_command,
+        input=prompt.encode(),
+        capture_output=True,
+        timeout=facets.timeout,
+    ))
+    raw = cli_result.stdout.decode()
+    if facets.debug:
+        print(f"[debug] exit code: {cli_result.returncode}")
+        print(f"[debug] stdout ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
+        if cli_result.stderr:
+            print(f"[debug] stderr: {cli_result.stderr.decode()[:500]}")
+    if cli_result.returncode != 0:
+        raise RuntimeError(
+            f"CLI command failed (exit {cli_result.returncode}): {cli_result.stderr.decode()}"
+        )
+    return raw
+
+
 def _parse_raw_response(raw: str, output_type: type[T], debug: bool) -> T:
     extracted = extract_json(raw)
     if debug:
@@ -134,7 +160,10 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                     print(f"[debug] raw output ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
                 parsed = _parse_raw_response(raw, output_type, facets.debug)
             else:
-                raise ValueError(f"Aspect {aspect.name} has no backend")
+                raw = await _invoke_cli(aspect, facets, prompt)
+                if facets.debug:
+                    print(f"[debug] raw output ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
+                parsed = _parse_raw_response(raw, output_type, facets.debug)
 
             validated = _validate_label_count(parsed, expected_count, aspect.name, attempt)
             if validated is None:
@@ -195,7 +224,7 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
     )
 
 
-def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices: list[int], gpu_layers: int | None, n_ctx: int, debug: bool) -> list[Aspect]:
+def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices: list[int], cpu: bool, gpu_layers: int | None, n_ctx: int, debug: bool) -> list[Aspect]:
     aspects: list[Aspect] = []
     if gpu:
         for device in devices:
@@ -216,6 +245,16 @@ def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices
                 openai_client = None,
                 openai_model = None,
             ))
+        if cpu:
+            model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
+            aspects.append(Aspect(
+                name = "local/cpu",
+                cli_command = None,
+                local_model = model,
+                local_n_ctx = model.n_ctx(),
+                openai_client = None,
+                openai_model = None,
+            ))
     else:
         model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
         aspects.append(Aspect(
@@ -227,6 +266,38 @@ def _create_local_aspects(local: str, local_file: str | None, gpu: bool, devices
             openai_model = None,
         ))
     return aspects
+
+
+def _create_cli_aspects(cli_command: list[str], concurrency: int) -> list[Aspect]:
+    print(f"CLI tool: {shlex.join(cli_command)} (concurrency {concurrency})")
+    return [
+        Aspect(
+            name = f"cli/{i}",
+            cli_command = cli_command,
+            local_model = None,
+            local_n_ctx = None,
+            openai_client = None,
+            openai_model = None,
+        )
+        for i in range(concurrency)
+    ]
+
+
+def _create_openai_aspects(openai_model: str, concurrency: int) -> list[Aspect]:
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI()
+    print(f"OpenAI model: {openai_model} (concurrency {concurrency})")
+    return [
+        Aspect(
+            name = f"openai/{i}",
+            cli_command = None,
+            local_model = None,
+            local_n_ctx = None,
+            openai_client = client,
+            openai_model = openai_model,
+        )
+        for i in range(concurrency)
+    ]
 
 
 def _create_embedding_model(openai_embedding_model: str | None, embedding_model: str, gpu: bool, devices: list[int], cpu_offload: bool, batch_size: int | None) -> tuple:
@@ -258,23 +329,15 @@ def _create_embedding_model(openai_embedding_model: str | None, embedding_model:
     return embedding, None, None, batch_size
 
 
-def initialize(repository: str, model_identity: str, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
+def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
     aspects: list[Aspect] = []
 
     if local is not None:
-        aspects.extend(_create_local_aspects(local, local_file, gpu, devices, gpu_layers, n_ctx, debug))
+        aspects.extend(_create_local_aspects(local, local_file, gpu, devices, cpu, gpu_layers, n_ctx, debug))
+    if cli_command is not None:
+        aspects.extend(_create_cli_aspects(cli_command, concurrency))
     if openai_model is not None:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI()
-        print(f"OpenAI model: {openai_model}")
-        aspects.append(Aspect(
-            name = "openai/0",
-            cli_command = None,
-            local_model = None,
-            local_n_ctx = None,
-            openai_client = client,
-            openai_model = openai_model,
-        ))
+        aspects.extend(_create_openai_aspects(openai_model, concurrency))
 
     if not aspects:
         raise SystemExit("Error: no inference backends available.")
