@@ -36,20 +36,22 @@ max_leaves = 20
 def initialize(
     completion_model: str,
     embedding_model_name: str,
-    openai_embedding_model: str | None = None,
+    local_embedding_model: str | None = None,
 ) -> Facets:
     from openai import AsyncOpenAI
 
     openai_client = AsyncOpenAI()
 
-    if openai_embedding_model is not None:
-        # OpenAI for embeddings
-        embedding = None
-    else:
+    if local_embedding_model is not None:
         # fastembed for local embeddings
         from fastembed import TextEmbedding
-        print(f"Loading embedding model ({embedding_model_name})...")
-        embedding = TextEmbedding(model_name=embedding_model_name)
+        print(f"Loading embedding model ({local_embedding_model})...")
+        embedding = TextEmbedding(model_name=local_embedding_model)
+        openai_embedding_model = None
+    else:
+        # OpenAI for embeddings (default)
+        embedding = None
+        openai_embedding_model = embedding_model_name
 
     return Facets(
         openai_client = openai_client,

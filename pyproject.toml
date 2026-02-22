@@ -12,11 +12,9 @@ dependencies = [
     "pydantic",
     "scikit-learn",
     "textual",
+    "tiktoken",
     "tqdm",
 ]
-
-[project.optional-dependencies]
-openai-embeddings = ["tiktoken"]
 
 [project.scripts]
 semantic-navigator = "semantic_navigator.main:main"
