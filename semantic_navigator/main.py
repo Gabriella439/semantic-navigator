@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import shlex
 import shutil
+import sys
 import time
 
 import textual
@@ -131,58 +132,95 @@ def _show_status(repository: str):
                     print(f"    {path}")
 
 
-def _parse_cli_tool(remaining: list[str], parser: argparse.ArgumentParser) -> list[str] | None:
-    if not remaining or not remaining[0].startswith("--"):
-        return None
-    tool_name = remaining[0][2:]
-    if shutil.which(tool_name) is None:
-        parser.error(f"CLI tool '{tool_name}' not found on PATH")
-    return [tool_name] + remaining[1:]
+_SUBCOMMANDS = {"openai", "local", "cli"}
 
 
-def _build_model_identity(arguments: argparse.Namespace, cli_command: list[str] | None) -> str:
-    identity_parts = []
-    if arguments.local:
-        identity_parts.append(f"local:{arguments.local}")
+def _parse_subcommand(argv: list[str]) -> tuple[str, list[str]]:
+    """Detect subcommand from argv, defaulting to 'openai'."""
+    for i, arg in enumerate(argv):
+        if arg.startswith("-"):
+            continue
+        if arg in _SUBCOMMANDS:
+            return arg, argv[:i] + argv[i + 1:]
+        break
+    return "openai", argv
+
+
+def _build_model_identity(subcommand: str, arguments: argparse.Namespace) -> str:
+    if subcommand == "openai":
+        return f"openai:{arguments.completion_model}"
+    elif subcommand == "local":
+        parts = [f"local:{arguments.local}"]
         if arguments.local_file:
-            identity_parts.append(f"file:{arguments.local_file}")
-    if cli_command:
-        identity_parts.append(f"cli:{shlex.join(cli_command)}")
-    if arguments.openai:
-        identity_parts.append(f"openai:{arguments.completion_model}")
-    return "+".join(identity_parts)
+            parts.append(f"file:{arguments.local_file}")
+        return "+".join(parts)
+    elif subcommand == "cli":
+        return f"cli:{shlex.join(arguments.cli_command)}"
+    return ""
 
 
 def main():
+    # Pre-parse to detect subcommand before argparse runs
+    argv = sys.argv[1:]
+    subcommand, remaining = _parse_subcommand(argv)
+
     parser = argparse.ArgumentParser(
         prog = "semantic-navigator",
         description = "Cluster documents by semantic facets",
     )
 
-    parser.add_argument("repository", nargs = "?")
-    parser.add_argument("--embedding-model", default = "BAAI/bge-large-en-v1.5")
-    parser.add_argument("--gpu", action = "store_true")
-    parser.add_argument("--cpu", action = "store_true", help = "Add a CPU local model worker alongside GPU workers")
-    parser.add_argument("--cpu-offload", action = "store_true")
-    parser.add_argument("--device", type = str, default = "0", help = "GPU device IDs, comma-separated (e.g. 0,1)")
-    parser.add_argument("--gpu-layers", type = int, default = None)
-    parser.add_argument("--batch-size", type = int, default = None)
-    parser.add_argument("--concurrency", type = int, default = None)
-    parser.add_argument("--timeout", type = int, default = 60)
+    # Utility flags (available on all subcommands)
     parser.add_argument("--list-devices", action = "store_true")
+    parser.add_argument("--erase-models", action = "store_true")
     parser.add_argument("--flush-cache", action = "store_true")
     parser.add_argument("--flush-labels", action = "store_true")
     parser.add_argument("--status", action = "store_true")
-    parser.add_argument("--erase-models", action = "store_true")
-    parser.add_argument("--openai", action = "store_true", help = "Use OpenAI API for labeling (requires OPENAI_API_KEY)")
-    parser.add_argument("--completion-model", default = "gpt-5-mini", help = "OpenAI model for labeling (default: gpt-5-mini)")
-    parser.add_argument("--openai-embedding-model", default = None, help = "OpenAI embedding model (default: text-embedding-3-small with --openai)")
-    parser.add_argument("--local", default = None)
-    parser.add_argument("--local-file", default = None)
-    parser.add_argument("--n-ctx", type = int, default = None)
     parser.add_argument("--debug", action = "store_true")
-    arguments, remaining = parser.parse_known_args()
 
+    # Subcommand-specific flags
+    if subcommand == "openai":
+        parser.add_argument("repository", nargs = "?")
+        parser.add_argument("--completion-model", default = "gpt-5-mini",
+                            help = "OpenAI model for labeling (default: gpt-5-mini)")
+        parser.add_argument("--embedding-model", default = "text-embedding-3-large",
+                            help = "OpenAI embedding model (default: text-embedding-3-large)")
+        parser.add_argument("--concurrency", type = int, default = 4)
+        parser.add_argument("--timeout", type = int, default = 60)
+
+    elif subcommand == "local":
+        parser.add_argument("repository", nargs = "?")
+        parser.add_argument("--embedding-model", default = "BAAI/bge-large-en-v1.5",
+                            help = "fastembed model for local embeddings (default: BAAI/bge-large-en-v1.5)")
+        parser.add_argument("--local", required = True,
+                            help = "HuggingFace model repo ID for GGUF completions")
+        parser.add_argument("--local-file", default = None,
+                            help = "Specific GGUF file name within the model repo")
+        parser.add_argument("--gpu", action = "store_true")
+        parser.add_argument("--cpu", action = "store_true",
+                            help = "Add a CPU local model worker alongside GPU workers")
+        parser.add_argument("--cpu-offload", action = "store_true")
+        parser.add_argument("--device", type = str, default = "0",
+                            help = "GPU device IDs, comma-separated (e.g. 0,1)")
+        parser.add_argument("--gpu-layers", type = int, default = None)
+        parser.add_argument("--batch-size", type = int, default = None)
+        parser.add_argument("--n-ctx", type = int, default = None)
+        parser.add_argument("--timeout", type = int, default = 60)
+
+    elif subcommand == "cli":
+        parser.add_argument("tool", help = "CLI tool name (e.g. gemini, llm)")
+        parser.add_argument("repository", nargs = "?")
+        parser.add_argument("--embedding-model", default = "BAAI/bge-large-en-v1.5",
+                            help = "fastembed model for local embeddings (default: BAAI/bge-large-en-v1.5)")
+        parser.add_argument("--concurrency", type = int, default = 4)
+        parser.add_argument("--timeout", type = int, default = 60)
+
+    if subcommand == "cli":
+        arguments, tool_remaining = parser.parse_known_args(remaining)
+        arguments.cli_command = [arguments.tool] + tool_remaining
+    else:
+        arguments = parser.parse_args(remaining)
+
+    # Handle utility commands
     if arguments.list_devices:
         list_devices()
         return
@@ -191,7 +229,7 @@ def main():
         _handle_erase_models()
         return
 
-    if arguments.repository is None:
+    if not hasattr(arguments, "repository") or arguments.repository is None:
         parser.error("the following arguments are required: repository")
 
     if arguments.flush_cache:
@@ -206,59 +244,51 @@ def main():
         _show_status(arguments.repository)
         return
 
-    cli_command = _parse_cli_tool(remaining, parser)
-    has_cli_tool = cli_command is not None
+    # Subcommand-specific validation and initialization
+    if subcommand == "openai":
+        model_identity = _build_model_identity(subcommand, arguments)
+        facets = initialize(
+            arguments.repository, model_identity, None, None, None,
+            arguments.embedding_model, False, False, False, [0], None,
+            None, arguments.concurrency, 8192, arguments.timeout,
+            arguments.debug, openai_model=arguments.completion_model,
+            openai_embedding_model=arguments.embedding_model,
+        )
 
-    if arguments.local is None and not has_cli_tool and not arguments.openai:
-        parser.error("no backend specified (e.g. --openai, --gemini, --llm, or --local)")
+    elif subcommand == "local":
+        if arguments.cpu_offload and not arguments.gpu:
+            parser.error("--cpu-offload requires --gpu")
+        if arguments.cpu and not arguments.gpu:
+            parser.error("--cpu only makes sense with --gpu (without --gpu, CPU is already the default)")
 
-    if arguments.cpu_offload and not arguments.gpu:
-        parser.error("--cpu-offload requires --gpu")
+        try:
+            devices = [int(d.strip()) for d in arguments.device.split(",")]
+        except ValueError:
+            parser.error(f"--device must be comma-separated integers, got: {arguments.device}")
 
-    if arguments.cpu and not arguments.gpu:
-        parser.error("--cpu only makes sense with --gpu (without --gpu, CPU is already the default)")
+        if arguments.n_ctx is None:
+            arguments.n_ctx = 8192
 
-    if arguments.gpu_layers is not None and arguments.local is None:
-        parser.error("--gpu-layers requires --local")
+        model_identity = _build_model_identity(subcommand, arguments)
+        facets = initialize(
+            arguments.repository, model_identity, None, arguments.local,
+            arguments.local_file, arguments.embedding_model, arguments.gpu,
+            arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers,
+            arguments.batch_size, 1, arguments.n_ctx, arguments.timeout,
+            arguments.debug,
+        )
 
-    if arguments.local_file is not None and arguments.local is None:
-        parser.error("--local-file requires --local")
+    elif subcommand == "cli":
+        if shutil.which(arguments.tool) is None:
+            parser.error(f"CLI tool '{arguments.tool}' not found on PATH")
 
-    if arguments.n_ctx is not None and arguments.local is None:
-        parser.error("--n-ctx requires --local")
-
-    if arguments.concurrency is not None and arguments.local is not None and not has_cli_tool and not arguments.openai:
-        parser.error("--concurrency has no effect with --local only (local model concurrency is 1 per device)")
-
-    try:
-        devices = [int(d.strip()) for d in arguments.device.split(",")]
-    except ValueError:
-        parser.error(f"--device must be comma-separated integers, got: {arguments.device}")
-
-    if arguments.n_ctx is None:
-        arguments.n_ctx = 8192
-    if arguments.concurrency is None:
-        arguments.concurrency = 4
-
-    model_identity = _build_model_identity(arguments, cli_command)
-    openai_model = arguments.completion_model if arguments.openai else None
-
-    # When using --openai, default to OpenAI embeddings unless overridden with 'local'
-    if arguments.openai and arguments.openai_embedding_model is None:
-        arguments.openai_embedding_model = "text-embedding-3-small"
-    if arguments.openai_embedding_model == "local":
-        arguments.openai_embedding_model = None
-    embedding_model_name = arguments.embedding_model
-    if arguments.openai_embedding_model:
-        embedding_model_name = arguments.openai_embedding_model
-
-    facets = initialize(
-        arguments.repository, model_identity, cli_command, arguments.local,
-        arguments.local_file, embedding_model_name, arguments.gpu, arguments.cpu,
-        arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size,
-        arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug,
-        openai_model=openai_model, openai_embedding_model=arguments.openai_embedding_model,
-    )
+        model_identity = _build_model_identity(subcommand, arguments)
+        facets = initialize(
+            arguments.repository, model_identity, arguments.cli_command,
+            None, None, arguments.embedding_model, False, False, False,
+            [0], None, None, arguments.concurrency, 8192, arguments.timeout,
+            arguments.debug,
+        )
 
     async def async_tasks():
         timings: dict[str, float] = {}
