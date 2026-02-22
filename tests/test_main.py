@@ -19,7 +19,7 @@ from semantic_navigator.inference import (
     _build_labels_schema, _parse_raw_response, _validate_label_count,
     max_count_retries,
 )
-from semantic_navigator.main import _build_model_identity, _parse_cli_tool, _show_status
+from semantic_navigator.main import _build_model_identity, _parse_subcommand, _show_status
 from semantic_navigator.models import Cluster, ClusterTree, Embed, Label, Labels, Tree
 from semantic_navigator.pipeline import (
     _count_tree_depth, _count_tree_leaves, count_cached_labels, to_files, to_pattern,
@@ -233,28 +233,25 @@ class TestParseRawResponse:
 # -- _build_model_identity --
 
 class TestBuildModelIdentity:
-    def _ns(self, **kwargs):
-        defaults = {"local": None, "local_file": None, "openai": False, "completion_model": "gpt-4o-mini"}
-        defaults.update(kwargs)
-        return argparse.Namespace(**defaults)
+    def test_openai(self):
+        ns = argparse.Namespace(completion_model="gpt-5-mini")
+        result = _build_model_identity("openai", ns)
+        assert result == "openai:gpt-5-mini"
 
-    def test_local_only(self):
-        result = _build_model_identity(self._ns(local="m/repo"), None)
+    def test_local(self):
+        ns = argparse.Namespace(local="m/repo", local_file=None)
+        result = _build_model_identity("local", ns)
         assert result == "local:m/repo"
 
-    def test_cli_only(self):
-        result = _build_model_identity(self._ns(), ["llm", "-m", "4o"])
-        assert "cli:" in result
+    def test_local_with_file(self):
+        ns = argparse.Namespace(local="m/repo", local_file="Q4.gguf")
+        result = _build_model_identity("local", ns)
+        assert result == "local:m/repo+file:Q4.gguf"
 
-    def test_openai_only(self):
-        result = _build_model_identity(self._ns(openai=True), None)
-        assert "openai:gpt-4o-mini" in result
-
-    def test_combo(self):
-        result = _build_model_identity(self._ns(local="m", openai=True), ["llm"])
-        assert "local:m" in result
-        assert "cli:llm" in result
-        assert "openai:" in result
+    def test_cli(self):
+        ns = argparse.Namespace(cli_command=["llm", "-m", "4o"])
+        result = _build_model_identity("cli", ns)
+        assert result == "cli:llm -m 4o"
 
 
 # -- _resolve_gpu_layers --
@@ -300,26 +297,36 @@ class TestCountCachedLabels:
 
 # -- _parse_cli_tool --
 
-class TestParseCliTool:
-    def test_valid_tool(self):
-        parser = argparse.ArgumentParser()
-        with patch("semantic_navigator.main.shutil.which", return_value="/usr/bin/echo"):
-            result = _parse_cli_tool(["--echo", "arg1"], parser)
-        assert result == ["echo", "arg1"]
+class TestParseSubcommand:
+    def test_default_to_openai(self):
+        sub, rest = _parse_subcommand(["./repo"])
+        assert sub == "openai"
+        assert rest == ["./repo"]
 
-    def test_no_remaining(self):
-        parser = argparse.ArgumentParser()
-        assert _parse_cli_tool([], parser) is None
+    def test_explicit_openai(self):
+        sub, rest = _parse_subcommand(["openai", "./repo"])
+        assert sub == "openai"
+        assert rest == ["./repo"]
 
-    def test_not_starting_with_dashes(self):
-        parser = argparse.ArgumentParser()
-        assert _parse_cli_tool(["foo"], parser) is None
+    def test_explicit_local(self):
+        sub, rest = _parse_subcommand(["local", "./repo", "--local", "m"])
+        assert sub == "local"
+        assert rest == ["./repo", "--local", "m"]
 
-    def test_tool_not_found(self):
-        parser = argparse.ArgumentParser()
-        with patch("semantic_navigator.main.shutil.which", return_value=None):
-            with pytest.raises(SystemExit):
-                _parse_cli_tool(["--nonexistent"], parser)
+    def test_explicit_cli(self):
+        sub, rest = _parse_subcommand(["cli", "gemini", "./repo"])
+        assert sub == "cli"
+        assert rest == ["gemini", "./repo"]
+
+    def test_flags_before_subcommand(self):
+        sub, rest = _parse_subcommand(["--debug", "local", "./repo"])
+        assert sub == "local"
+        assert rest == ["--debug", "./repo"]
+
+    def test_no_args(self):
+        sub, rest = _parse_subcommand([])
+        assert sub == "openai"
+        assert rest == []
 
 
 # -- _show_status --
@@ -563,18 +570,8 @@ class TestAppCacheDir:
 # -- _build_model_identity (additional) --
 
 class TestBuildModelIdentityAdditional:
-    def _ns(self, **kwargs):
-        defaults = {"local": None, "local_file": None, "openai": False, "completion_model": "gpt-4o-mini"}
-        defaults.update(kwargs)
-        return argparse.Namespace(**defaults)
-
-    def test_local_with_file(self):
-        result = _build_model_identity(self._ns(local="repo", local_file="*Q4.gguf"), None)
-        assert "local:repo" in result
-        assert "file:*Q4.gguf" in result
-
-    def test_no_backends_empty(self):
-        result = _build_model_identity(self._ns(), None)
+    def test_unknown_subcommand_empty(self):
+        result = _build_model_identity("unknown", argparse.Namespace())
         assert result == ""
 
 
