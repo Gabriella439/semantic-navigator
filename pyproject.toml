@@ -9,6 +9,7 @@ dependencies = [
     "dulwich",
     "openai[aiohttp]",
     "pydantic",
+    "psutil",
     "scikit-learn",
     "textual",
     "tiktoken",

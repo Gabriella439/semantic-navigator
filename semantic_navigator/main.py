@@ -6,6 +6,7 @@ import itertools
 import math
 import numpy
 import os
+import psutil
 import scipy
 import sklearn
 import textual
@@ -73,6 +74,31 @@ max_tokens_per_embed = 8192
 
 max_tokens_per_batch_embed = 300000
 
+# Increase the soft limit on the number of open file descriptors and return the
+# available number of descriptors our code should use
+def tune_open_descriptors() -> int:
+    # Use the current number of file descriptors in use to estimate how many
+    # file descriptors to reserve
+    num_fds = psutil.Process(os.getpid()).num_fds()
+
+    reserve = 3 * num_fds
+
+    if os.name == "posix":
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+        desired = max(soft, hard - reserve)
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+
+        return hard
+    else:
+        # A quick search shows that the default limit (imposed by stdio) is 512
+        # on Windows, which is probably a safe value to use for all non-POSIX
+        # platforms
+        return 512 - reserve
+
 async def embed(facets: Facets, directory: str) -> Cluster:
     try:
         repo = Repo.discover(directory)
@@ -96,11 +122,17 @@ async def embed(facets: Facets, directory: str) -> Cluster:
                 if entry.is_file(follow_symlinks = False):
                     yield entry.path
 
+    # Half the smallest `ulimit` value commonly found in the wild (1024 on
+    # Linux)
+    available_descriptors = tune_open_descriptors()
+
+    semaphore = asyncio.Semaphore(available_descriptors)
+
     async def read(path) -> list[tuple[str, str]]:
         try:
             absolute_path = os.path.join(directory, path)
 
-            async with aiofiles.open(absolute_path, "rb") as handle:
+            async with semaphore, aiofiles.open(absolute_path, "rb") as handle:
                 prefix = f"{path}:\n\n"
 
                 bytestring = await handle.read()
