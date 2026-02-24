@@ -106,8 +106,9 @@ async def _embed_with_openai(facets: Facets, contents: list[str]) -> list[NDArra
     batches = list(batched(truncated_contents, max_embeds_per_batch))
     new_embeddings_nested = await tqdm_asyncio.gather(
         *(openai_embed_batch(list(batch)) for batch in batches),
-        desc = f"Embedding contents ({len(contents)} files)",
+        desc = f"Embedding contents",
         unit = "batch",
+        total = len(contents),
         leave = False,
     )
     return [e for batch_result in new_embeddings_nested for e in batch_result]
