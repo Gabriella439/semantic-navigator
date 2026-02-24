@@ -525,7 +525,7 @@ class UI(textual.app.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog = "facets",
+        prog = "semantic-navigator",
         description = "Cluster documents by semantic facets",
     )
 
