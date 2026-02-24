@@ -45,7 +45,6 @@ def initialize(
     if local_embedding_model is not None:
         # fastembed for local embeddings
         from fastembed import TextEmbedding
-        print(f"Loading embedding model ({local_embedding_model})...")
         embedding = TextEmbedding(model_name=local_embedding_model)
         openai_embedding_model = None
     else:
