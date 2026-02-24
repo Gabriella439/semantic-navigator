@@ -11,6 +11,7 @@ dependencies = [
     "pydantic",
     "psutil",
     "scikit-learn",
+    "retry",
     "textual",
     "tiktoken",
     "tqdm",

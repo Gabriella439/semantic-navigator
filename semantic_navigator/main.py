@@ -22,7 +22,9 @@ from numpy import float32
 from numpy.typing import NDArray
 from pathlib import PurePath
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
+from openai.types.responses import ParsedResponse
+from retry import retry
 from sklearn.neighbors import NearestNeighbors
 from tiktoken import Encoding
 from typing import Iterable
@@ -184,6 +186,7 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
+    @retry(RateLimitError, tries = 3, delay = 1)
     async def embed_batch(input) -> list[NDArray[float32]]:
         response = await facets.openai_client.embeddings.create(
             model = facets.embedding_model,
@@ -435,6 +438,14 @@ def to_files(trees: list[Tree]) -> list[str]:
 async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
 
+    @retry(RateLimitError, tries = 3, delay = 1)
+    async def parse_labels(input: str) -> ParsedResponse[Labels]:
+        return await facets.openai_client.responses.parse(
+            model = facets.completion_model,
+            input = input,
+            text_format = Labels
+        )
+
     if len(children) == 1:
         def render_embed(embed: Embed) -> str:
             return f"# File: {embed.entry}\n\n{embed.content}"
@@ -443,11 +454,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
 
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
-        )
+        response = await parse_labels(input)
 
         assert response.output_parsed is not None
 
@@ -480,11 +487,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
 
-        response = await facets.openai_client.responses.parse(
-            model = facets.completion_model,
-            input = input,
-            text_format = Labels
-        )
+        response = await parse_labels(input)
 
         assert response.output_parsed is not None
 
