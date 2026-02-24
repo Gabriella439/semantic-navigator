@@ -119,7 +119,7 @@ def _embed_with_fastembed(facets: Facets, contents: list[str]) -> list[NDArray[f
         numpy.asarray(e, float32)
         for e in tqdm(
             facets.embedding_model.embed(contents),
-            desc = f"Embedding contents ({len(contents)} files)",
+            desc = f"Embedding contents",
             unit = "file",
             total = len(contents),
             leave = False
