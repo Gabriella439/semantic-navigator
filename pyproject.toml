@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiofiles",
     "dulwich",
+    "fastembed",
     "openai[aiohttp]",
     "pydantic",
     "scikit-learn",

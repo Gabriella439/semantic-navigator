@@ -7,7 +7,6 @@ import textual.widgets
 
 from semantic_navigator.models import Tree
 from semantic_navigator.pipeline import initialize, embed, tree
-from semantic_navigator.util import to_files
 
 
 class UI(textual.app.App):
@@ -35,16 +34,23 @@ class UI(textual.app.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog = "facets",
+        prog = "semantic-navigator",
         description = "Cluster documents by semantic facets",
     )
 
     parser.add_argument("repository")
     parser.add_argument("--completion-model", default = "gpt-5-mini")
-    parser.add_argument("--embedding-model", default = "text-embedding-3-large")
+    parser.add_argument("--embedding-model", default = "text-embedding-3-large",
+                        help = "OpenAI embedding model (default: text-embedding-3-large)")
+    parser.add_argument("--local-embedding-model", default = None,
+                        help = "Use local fastembed model instead of OpenAI (e.g. BAAI/bge-large-en-v1.5)")
     arguments = parser.parse_args()
 
-    facets = initialize(arguments.completion_model, arguments.embedding_model)
+    facets = initialize(
+        arguments.completion_model,
+        arguments.embedding_model,
+        local_embedding_model = arguments.local_embedding_model,
+    )
 
     async def async_tasks():
         initial_cluster = await embed(facets, arguments.repository)

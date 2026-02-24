@@ -2,17 +2,15 @@ from dataclasses import dataclass
 from numpy import float32
 from numpy.typing import NDArray
 from pydantic import BaseModel
-from openai import AsyncOpenAI
-from tiktoken import Encoding
 
 
 @dataclass(frozen = True)
 class Facets:
-    openai_client: AsyncOpenAI
-    embedding_model: str
+    openai_client: object | None
+    embedding_model: object | None
+    embedding_model_name: str
     completion_model: str
-    embedding_encoding: Encoding
-    completion_encoding: Encoding
+    openai_embedding_model: str | None
 
 
 @dataclass(frozen = True)
