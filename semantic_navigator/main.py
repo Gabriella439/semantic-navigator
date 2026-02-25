@@ -564,28 +564,84 @@ async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
 
     return Tree(label, to_files(children), children)
 
+def filtered_trees(filter_text: str, t: Tree) -> list[Tree]:
+    new_children = [
+        filtered_tree
+        for child in t.children
+        for filtered_tree in filtered_trees(filter_text, child)
+    ]
+
+    if new_children or filter_text in t.label.lower():
+        return [ Tree(t.label, t.files, new_children) ]
+    else:
+        return [ ]
+
 class UI(textual.app.App):
+    BINDINGS = [
+        ("slash", "focus_search", "Search"),
+        ("escape", "exit_search", "Clear"),
+    ]
+
     def __init__(self, tree_):
         super().__init__()
+
+        self.search = textual.widgets.Input(
+            placeholder="Type / to search"
+        )
+
         self.tree_ = tree_
 
-    async def on_mount(self):
-        self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+    def _build_tree(self, filter_text: str = ""):
+        self.treeview.clear()
+
+        trees = filtered_trees(filter_text, self.tree_)
+
+        if trees:
+            filtered = trees[0]
+        else:
+            filtered = Tree(self.tree_.label, [], [])
+
+        self.treeview.root.set_label(f"{filtered.label} ({len(filtered.files)})")
 
         def loop(node, children):
             for child in children:
                 if len(child.files) <= 1:
-                    n = node.add(child.label)
-                    n.allow_expand = False
+                    n = node.add(child.label, allow_expand = False)
                 else:
-                    n = node.add(f"{child.label} ({len(child.files)})")
-                    n.allow_expand = True
+                    n = node.add(
+                        f"{child.label} ({len(child.files)})",
+                        allow_expand = True
+                    )
 
                     loop(n, child.children)
 
-        loop(self.treeview.root, self.tree_.children)
+        _ = loop(self.treeview.root, filtered.children)
 
+        if filter_text:
+            self.treeview.root.expand_all()
+        else:
+            self.treeview.root.expand()
+
+    async def on_mount(self):
+        self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+
+        self._build_tree()
+
+        self.mount(self.search)
         self.mount(self.treeview)
+
+        self.treeview.focus()
+
+    def action_focus_search(self):
+        self.search.focus()
+        self.search.placeholder = "Type ESC to navigate"
+
+    def action_exit_search(self):
+        self.search.placeholder = "Type / to search"
+        self.treeview.focus()
+
+    def on_input_changed(self, event):
+        self._build_tree(event.value.strip().lower())
 
 def main():
     parser = argparse.ArgumentParser(
