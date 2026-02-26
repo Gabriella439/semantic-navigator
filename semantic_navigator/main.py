@@ -15,6 +15,7 @@ import sklearn
 import textual
 import textual.app
 import textual.widgets
+import tenacity
 import tiktoken
 
 from asyncio import Semaphore
@@ -28,7 +29,7 @@ from numpy.typing import NDArray
 from pathlib import PurePath
 from pydantic import BaseModel
 from openai import AsyncOpenAI, RateLimitError
-from retry import retry
+from tenacity import retry
 from sklearn.neighbors import NearestNeighbors
 from tiktoken import Encoding
 from typing import Iterable
@@ -38,7 +39,8 @@ max_clusters = 20
 
 @dataclass(frozen = True)
 class Facets:
-    openai_client: AsyncOpenAI
+    embedding_client: AsyncOpenAI
+    completion_client: AsyncOpenAI
     embedding_model: str
     completion_model: str
     embedding_encoding: Encoding
@@ -46,19 +48,33 @@ class Facets:
     semaphore: Semaphore
     cache_directory: str
 
-def initialize(completion_model: str, embedding_model: str) -> Facets:
-    openai_client = AsyncOpenAI()
+def initialize(
+    embedding_model : str,
+    completion_model: str,
+    embedding_base_url : str | None = None,
+    completion_base_url: str | None = None,
+    embedding_encoding_name : str | None = None,
+    completion_encoding_name: str | None = None,
+) -> Facets:
+    embedding_client  = AsyncOpenAI(base_url = embedding_base_url )
+    completion_client = AsyncOpenAI(base_url = completion_base_url)
 
-    embedding_model = embedding_model
-
+    embedding_model  = embedding_model
     completion_model = completion_model
 
     embedding_encoding = tiktoken.encoding_for_model(embedding_model)
 
-    try:
-        completion_encoding = tiktoken.encoding_for_model(completion_model)
-    except KeyError:
-        completion_encoding = tiktoken.get_encoding("o200k_base")
+    def to_encoding(encoding_name: str | None, model: str) -> Encoding:
+        if encoding_name is None:
+            try:
+                return tiktoken.encoding_for_model(model)
+            except KeyError:
+                return tiktoken.get_encoding("o200k_base")
+        else:
+            return tiktoken.get_encoding(encoding_name)
+
+    completion_encoding = to_encoding(completion_encoding_name, completion_model)
+    embedding_encoding  = to_encoding(embedding_encoding_name , embedding_model )
 
     cache_directory = platformdirs.user_cache_dir(
         appname = "semantic-navigator",
@@ -72,7 +88,8 @@ def initialize(completion_model: str, embedding_model: str) -> Facets:
     semaphore = asyncio.Semaphore(available_descriptors)
 
     return Facets(
-        openai_client = openai_client,
+        embedding_client = embedding_client,
+        completion_client = completion_client,
         embedding_model = embedding_model,
         completion_model = completion_model,
         embedding_encoding = embedding_encoding,
@@ -215,13 +232,13 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
-    @retry(RateLimitError, tries = 3, delay = 1)
+    @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
     async def embed_batch(items: list[tuple[int, tuple[str, str]]]) -> list[tuple[int, NDArray[float32]]]:
         indices, pairs = zip(*items)
 
         cache_files, input = zip(*pairs)
 
-        response = await facets.openai_client.embeddings.create(
+        response = await facets.embedding_client.embeddings.create(
             model = facets.embedding_model,
             input = input
         )
@@ -478,24 +495,39 @@ def to_files(trees: list[Tree]) -> list[str]:
 async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
 
-    @retry(RateLimitError, tries = 3, delay = 1)
-    async def label_inputs(input: str) -> list[str]:
+    @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
+    async def label_inputs(input: str, expected_length: int) -> list[str]:
         h = hashlib.sha256(facets.completion_model.encode("utf-8"))
 
         h.update(input.encode("utf-8"))
 
         cache_file = os.path.join(facets.cache_directory, h.hexdigest())
 
+        @retry(retry = tenacity.retry_if_exception_type(AssertionError), stop = tenacity.stop_after_attempt(3))
         async def compute() -> list[str]:
-            response = await facets.openai_client.responses.parse(
+            response = await facets.completion_client.chat.completions.parse(
                 model = facets.completion_model,
-                input = input,
-                text_format = Labels
+                messages = [
+                    { "role": "user", "content": input },
+                ],
+                response_format = Labels
             )
 
-            assert response.output_parsed is not None
+            text = response.choices[0].message.content
 
-            return [ label.label for label in response.output_parsed.labels ]
+            assert text is not None
+
+            parsed = Labels.model_validate_json(text)
+
+            labels = [ label.label for label in parsed.labels ]
+
+            assertion = len(labels) == expected_length
+            if not assertion:
+                print(labels)
+                print(expected_length)
+                assert assertion
+
+            return labels
 
         if os.path.exists(cache_file):
             async with facets.semaphore, aiofiles.open(cache_file, "r") as handle:
@@ -519,9 +551,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         input = f"Label each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
 
-        labels = await label_inputs(input)
-
-        # assert len(labels) == len(c.embeds)
+        labels = await label_inputs(input, len(c.embeds))
 
         return [
             Tree(f"{embed.entry}: {label}", [ embed.entry ], [])
@@ -550,9 +580,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
 
-        labels = await label_inputs(input)
-
-        # assert len(labels) == len(children)
+        labels = await label_inputs(input, len(treess))
 
         return [
             Tree(f"{to_pattern(to_files(trees))}{label}", to_files(trees), trees)
@@ -650,11 +678,22 @@ def main():
     )
 
     parser.add_argument("repository")
-    parser.add_argument("--completion-model", default = "gpt-5-mini")
+    parser.add_argument("--embedding-base-url")
+    parser.add_argument("--completion-base-url")
     parser.add_argument("--embedding-model", default = "text-embedding-3-large")
+    parser.add_argument("--completion-model", default = "gpt-5-mini")
+    parser.add_argument("--completion-encoding")
+    parser.add_argument("--embedding-encoding")
     arguments = parser.parse_args()
 
-    facets = initialize(arguments.completion_model, arguments.embedding_model)
+    facets = initialize(
+        arguments.embedding_model,
+        arguments.completion_model,
+        embedding_base_url = arguments.embedding_base_url,
+        completion_base_url = arguments.completion_base_url,
+        embedding_encoding_name = arguments.embedding_encoding,
+        completion_encoding_name = arguments.completion_encoding,
+    )
 
     async def async_tasks():
         initial_cluster = await embed(facets, arguments.repository)
