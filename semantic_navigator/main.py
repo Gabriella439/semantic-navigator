@@ -521,11 +521,7 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
             labels = [ label.label for label in parsed.labels ]
 
-            assertion = len(labels) == expected_length
-            if not assertion:
-                print(labels)
-                print(expected_length)
-                assert assertion
+            assert len(labels) == expected_length
 
             return labels
 
