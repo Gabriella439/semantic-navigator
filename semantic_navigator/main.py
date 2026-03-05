@@ -29,6 +29,7 @@ from numpy.typing import NDArray
 from pathlib import PurePath
 from pydantic import BaseModel
 from openai import AsyncOpenAI, RateLimitError
+from openai.types.chat import ChatCompletionUserMessageParam
 from tenacity import retry
 from sklearn.neighbors import NearestNeighbors
 from tiktoken import Encoding
@@ -48,7 +49,62 @@ class Facets:
     semaphore: Semaphore
     cache_directory: str
 
-def initialize(
+async def embed_batch_with_cache(
+    cache_directory: str,
+    semaphore: Semaphore,
+    embedding_client: AsyncOpenAI,
+    embedding_model: str,
+    max_embeds: int,
+    contents: list[str]
+) -> list[NDArray[float32]]:
+    cached:   dict[int, NDArray[float32]] = { }
+    uncached: dict[int, tuple[str,str]  ] = { }
+
+    for index, content in enumerate(contents):
+        bytes = f"{embedding_model}{content}".encode("utf-8")
+
+        hash = hashlib.sha256(bytes).hexdigest()
+
+        cache_file = os.path.join(cache_directory, f"{hash}.npy")
+
+        if os.path.exists(cache_file):
+            async with semaphore:
+                cached[index] = numpy.load(cache_file)
+        else:
+            uncached[index] = (cache_file, content)
+
+    @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
+    async def embed_batch(items: list[tuple[int, tuple[str, str]]]) -> list[tuple[int, NDArray[float32]]]:
+        indices, pairs = zip(*items)
+
+        cache_files, input = zip(*pairs)
+
+        response = await embedding_client.embeddings.create(
+            model = embedding_model,
+            input = input
+        )
+
+        outputs = [
+            numpy.asarray(datum.embedding, float32) for datum in response.data
+        ]
+
+        for cache_file, output in zip(cache_files, outputs):
+            numpy.save(cache_file, output)
+
+        return list(zip(indices, outputs))
+
+    tasks = tqdm_asyncio.gather(
+        *(embed_batch(list(items)) for items in batched(uncached.items(), max_embeds)),
+        desc = "Embedding contents",
+        unit = "batch",
+        leave = False
+    )
+
+    computed: dict[int, NDArray[float32]] = dict(list(chain.from_iterable(await tasks)))
+
+    return list((cached | computed).values())
+
+async def initialize(
     embedding_model : str,
     completion_model: str,
     embedding_base_url : str | None = None,
@@ -95,7 +151,45 @@ def initialize(
         embedding_encoding = embedding_encoding,
         completion_encoding = completion_encoding,
         semaphore = semaphore,
-        cache_directory = cache_directory
+        cache_directory = cache_directory,
+    )
+
+@dataclass(frozen = True)
+class NeighboringLabels:
+    candidate_labels: list[str]
+    candidate_neighbors: NearestNeighbors
+
+async def compute_neighboring_labels(facets: Facets):
+    async with aiofiles.open("labels.txt", 'r') as handle:
+        candidate_labels = [
+            ' '.join(line.split(' ')[:2])
+            async for line in handle
+        ]
+
+        candidate_labels = [
+            candidate_label
+            for candidate_label in candidate_labels
+            if candidate_label
+        ]
+
+    embeddings = await embed_batch_with_cache(
+        facets.cache_directory,
+        facets.semaphore,
+        facets.embedding_client,
+        facets.embedding_model,
+        2048,
+        candidate_labels
+    )
+
+    candidate_neighbors = NearestNeighbors(
+        n_neighbors = 1,
+        metric = "cosine",
+        n_jobs = -1,
+    ).fit(embeddings)
+
+    return NeighboringLabels(
+        candidate_labels = candidate_labels,
+        candidate_neighbors = candidate_neighbors
     )
 
 @dataclass(frozen = True)
@@ -117,9 +211,14 @@ max_tokens_per_batch_embed = 300000
 def ensure_open_descriptors() -> int:
     # Use the current number of file descriptors in use to estimate how many
     # file descriptors to reserve
-    num_fds = psutil.Process(os.getpid()).num_fds()
+    process = psutil.Process(os.getpid())
 
-    reserve = 3 * num_fds
+    if hasattr(process, 'num_fds'):
+        num_fds = process.num_fds()
+
+        reserve = 3 * num_fds
+    else:
+        reserve = 0
 
     if os.name == "posix":
         import resource
@@ -214,54 +313,14 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     paths, contents = zip(*results)
 
-    cached:   dict[int, NDArray[float32]] = { }
-    uncached: dict[int, tuple[str,str]  ] = { }
-
-    for index, content in enumerate(contents):
-        bytes = f"{facets.embedding_model}{content}".encode("utf-8")
-
-        hash = hashlib.sha256(bytes).hexdigest()
-
-        cache_file = os.path.join(facets.cache_directory, f"{hash}.npy")
-
-        if os.path.exists(cache_file):
-            async with facets.semaphore:
-                cached[index] = numpy.load(cache_file)
-        else:
-            uncached[index] = (cache_file, content)
-
-    max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
-
-    @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
-    async def embed_batch(items: list[tuple[int, tuple[str, str]]]) -> list[tuple[int, NDArray[float32]]]:
-        indices, pairs = zip(*items)
-
-        cache_files, input = zip(*pairs)
-
-        response = await facets.embedding_client.embeddings.create(
-            model = facets.embedding_model,
-            input = input
-        )
-
-        outputs = [
-            numpy.asarray(datum.embedding, float32) for datum in response.data
-        ]
-
-        for cache_file, output in zip(cache_files, outputs):
-            numpy.save(cache_file, output)
-
-        return list(zip(indices, outputs))
-
-    tasks = tqdm_asyncio.gather(
-        *(embed_batch(list(items)) for items in batched(uncached.items(), max_embeds)),
-        desc = "Embedding contents",
-        unit = "batch",
-        leave = False
+    embeddings = await embed_batch_with_cache(
+        facets.cache_directory,
+        facets.semaphore,
+        facets.embedding_client,
+        facets.embedding_model,
+        math.floor(max_tokens_per_batch_embed / max_tokens_per_embed),
+        contents
     )
-
-    computed: dict[int, NDArray[float32]] = dict(list(chain.from_iterable(await tasks)))
-
-    embeddings = (cached | computed).values()
 
     embeds = [
         Embed(path, content, embedding)
@@ -492,7 +551,16 @@ class Labels(BaseModel):
 def to_files(trees: list[Tree]) -> list[str]:
     return [ file for tree in trees for file in tree.files ]
 
-async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
+def label_vector(neighboring_labels: NeighboringLabels, vector: NDArray[float32]) -> str:
+    index = neighboring_labels.candidate_neighbors.kneighbors(
+        X = [vector],
+        n_neighbors = 1,
+        return_distance = False
+    )[0][0]
+
+    return neighboring_labels.candidate_labels[index]
+
+async def label_nodes(facets: Facets, neighboring_labels: NeighboringLabels, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
 
     @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
@@ -505,10 +573,12 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
 
         @retry(retry = tenacity.retry_if_exception_type(AssertionError), stop = tenacity.stop_after_attempt(3))
         async def compute() -> list[str]:
+            message: ChatCompletionUserMessageParam = { "role": "user", "content": input }
+
             response = await facets.completion_client.chat.completions.parse(
                 model = facets.completion_model,
                 messages = [
-                    { "role": "user", "content": input },
+                    message
                 ],
                 response_format = Labels
             )
@@ -557,34 +627,34 @@ async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     else:
         if depth == 0:
             treess = await tqdm_asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
+                *(label_nodes(facets, neighboring_labels, child, depth + 1) for child in children),
                 desc = "Labeling clusters",
                 unit = "cluster",
                 leave = False
             )
         else:
             treess = await asyncio.gather(
-                *(label_nodes(facets, child, depth + 1) for child in children),
+                *(label_nodes(facets, neighboring_labels, child, depth + 1) for child in children),
             )
 
-        def render_cluster(trees: list[Tree]) -> str:
-            rendered_trees = "\n".join([ tree.label for tree in trees ])
+        def label_cluster(child: Cluster) -> str:
+            vectors = [ embed.embedding for embed in child.embeds ]
 
-            return f"# Cluster\n\n{rendered_trees}"
+            mean = numpy.mean(vectors, axis = 0)
 
-        rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
+            normalized = sklearn.preprocessing.normalize([mean])[0]
 
-        input = f"Label each cluster in 2 words.  Don't include file path/names in labels.\n\n{rendered_clusters}"
+            return label_vector(neighboring_labels, normalized)
 
-        labels = await label_inputs(input, len(treess))
+        labels = [ label_cluster(child) for child in children ]
 
         return [
             Tree(f"{to_pattern(to_files(trees))}{label}", to_files(trees), trees)
             for label, trees in zip(labels, treess)
         ]
 
-async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    children = await label_nodes(facets, c, 0)
+async def tree(facets: Facets, neighboring_labels: NeighboringLabels, label: str, c: Cluster) -> Tree:
+    children = await label_nodes(facets, neighboring_labels, c, 0)
 
     return Tree(label, to_files(children), children)
 
@@ -682,19 +752,21 @@ def main():
     parser.add_argument("--embedding-encoding")
     arguments = parser.parse_args()
 
-    facets = initialize(
-        arguments.embedding_model,
-        arguments.completion_model,
-        embedding_base_url = arguments.embedding_base_url,
-        completion_base_url = arguments.completion_base_url,
-        embedding_encoding_name = arguments.embedding_encoding,
-        completion_encoding_name = arguments.completion_encoding,
-    )
-
     async def async_tasks():
+        facets = await initialize(
+            arguments.embedding_model,
+            arguments.completion_model,
+            embedding_base_url = arguments.embedding_base_url,
+            completion_base_url = arguments.completion_base_url,
+            embedding_encoding_name = arguments.embedding_encoding,
+            completion_encoding_name = arguments.completion_encoding,
+        )
+
+        neighboring_labels = await compute_neighboring_labels(facets)
+
         initial_cluster = await embed(facets, arguments.repository)
 
-        tree_ = await tree(facets, arguments.repository, initial_cluster)
+        tree_ = await tree(facets, neighboring_labels, arguments.repository, initial_cluster)
 
         return tree_
 
