@@ -145,7 +145,7 @@ async def embed(facets: Facets, directory: str) -> Cluster:
             for bytestring in repo.open_index().paths():
                 path = bytestring.decode("utf-8")
 
-                subdirectory = PurePath(directory).relative_to(repo.path)
+                subdirectory = PurePath(os.path.realpath(directory)).relative_to(repo.path)
 
                 try:
                     relative_path = PurePath(path).relative_to(subdirectory)
